@@ -15,14 +15,17 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from . import export as exporter
 from . import loaders, style, view3d
 from .loaders import LoadError
 from .sample import build_sample_volume
 from .view2d import SliceView
 from .volume import (SLICE_LABELS, SeisVolume, agc, compute_clim, decimate, stats)
-from .widgets import (ArrayViewDialog, ChevronButton, ColormapCombo, PlayheadTrack,
-                      SectionLabel, SegmentedControl, SliderRow, ValueLabel,
-                      VariableTable, ask_axis_order, make_panel)
+from .widgets import (ArrayViewDialog, ChevronButton, ColormapCombo, ExportDialog,
+                      PlayheadTrack, SectionLabel, SegmentedControl, SliderRow,
+                      ValueLabel, VariableTable, WheelSafeComboBox,
+                      WheelSafeDoubleSpinBox, WheelSafeSpinBox,
+                      ask_axis_order, make_panel)
 
 # 扫掠速度：显示名 → 定时器间隔 (ms)
 SPEEDS = [("慢", 150), ("中", 70), ("快", 35), ("极快", 16)]
@@ -101,6 +104,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._place_done = False
         self._build_ui()
         self._place_window()
+
+        # 快捷键：键盘党最常用的两个
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+O"), self, self.open_file)
+        QtGui.QShortcut(QtGui.QKeySequence("Ctrl+E"), self, self.export_volume)
 
     def _place_window(self) -> None:
         """按目标屏幕的可用区域定初始尺寸与位置。
@@ -207,8 +214,18 @@ class MainWindow(QtWidgets.QMainWindow):
             "sample_data/ 里的 .npz/.npy/.mat 请用「打开文件」。")
         self.btn_sample.clicked.connect(self.load_sample)
 
+        self.btn_export = QtWidgets.QPushButton("导出 / 转换")
+        self.btn_export.setObjectName("Ghost")
+        self.btn_export.setMinimumWidth(104)
+        self.btn_export.setEnabled(False)
+        self.btn_export.setToolTip(
+            "把当前体数据导出成矩阵（.npy / .npz / .mat），\n"
+            "或按规则合成道头写成 SEG-Y / SU。　快捷键 Ctrl+E")
+        self.btn_export.clicked.connect(self.export_volume)
+
         row.addWidget(self.btn_open)
         row.addWidget(self.btn_sample)
+        row.addWidget(self.btn_export)
         lay.addLayout(row)
         return bar
 
@@ -226,8 +243,10 @@ class MainWindow(QtWidgets.QMainWindow):
         col.setSpacing(8)
         col.addWidget(self._card_source())
         col.addWidget(self._card_slice())
-        col.addWidget(self._card_playback())
+        # "显示"要放在"扫掠播放"前面：色标/对比度/AGC/wiggle/抽稀是调得最勤的一组，
+        # 排在播放后面就得先滚一段才够得着。
         col.addWidget(self._card_display())
+        col.addWidget(self._card_playback())
         col.addStretch(1)
         scroll.setWidget(inner)
         return scroll
@@ -236,12 +255,12 @@ class MainWindow(QtWidgets.QMainWindow):
         card, lay = make_panel("数据源")
 
         self.table = VariableTable()
-        self.table.setMinimumHeight(104)
+        self.table.setMinimumHeight(86)
         self.table.itemSelectionChanged.connect(self._on_variable_selected)
         self.table.itemDoubleClicked.connect(lambda _i: self._load_selected_variable())
         lay.addWidget(self.table)
 
-        hint = QtWidgets.QLabel("双击变量直接载入；一维变量可看数值与波形，二维/三维作为体数据展示。")
+        hint = QtWidgets.QLabel("双击变量直接载入；一维变量看数值与波形。")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         lay.addWidget(hint)
@@ -260,6 +279,13 @@ class MainWindow(QtWidgets.QMainWindow):
             grid.addWidget(lab, i, 0)
             grid.addWidget(w, i, 1)
         lay.addLayout(grid)
+        # 改完立刻生效（原先改了要重新载入才看得出差别），并同步三视图的标尺
+        for w in (self.spin_dt, self.spin_dx, self.spin_ds):
+            w.editingFinished.connect(self._apply_scales)
+        scale_tip = QtWidgets.QLabel("改完回车即生效（只影响坐标显示）")
+        scale_tip.setObjectName("Hint")
+        scale_tip.setWordWrap(True)
+        lay.addWidget(scale_tip)
 
         self.btn_load = QtWidgets.QPushButton("载入所选变量")
         self.btn_load.setObjectName("Primary")
@@ -276,7 +302,7 @@ class MainWindow(QtWidgets.QMainWindow):
     @staticmethod
     def _spin(lo: float, hi: float, val: float, decimals: int,
               suffix: str) -> QtWidgets.QDoubleSpinBox:
-        box = QtWidgets.QDoubleSpinBox()
+        box = WheelSafeDoubleSpinBox()          # 滚轮不改值，见 widgets._NoWheelMixin
         box.setRange(lo, hi)
         box.setDecimals(decimals)
         box.setValue(val)
@@ -302,7 +328,22 @@ class MainWindow(QtWidgets.QMainWindow):
         self.playhead.seek.connect(self._on_slice_index)
         lay.addWidget(self.playhead)
 
-        tip = QtWidgets.QLabel("在三维立方体上点击某个面，或直接拖动上面这条轨道扫掠。")
+        # 单步精确调整：放在"切片模式"里更合逻辑（原先混在连续播放那组按钮中间，
+        # 容易误点成播放）
+        step = QtWidgets.QHBoxLayout()
+        step.setContentsMargins(0, 0, 0, 0)
+        step.setSpacing(6)
+        self.btn_prev = QtWidgets.QPushButton("◀  上一切片")
+        self.btn_prev.setToolTip("切换到前一个切片")
+        self.btn_prev.clicked.connect(lambda: self._step(-1))
+        self.btn_next = QtWidgets.QPushButton("下一切片  ▶")
+        self.btn_next.setToolTip("切换到后一个切片")
+        self.btn_next.clicked.connect(lambda: self._step(1))
+        step.addWidget(self.btn_prev, 1)
+        step.addWidget(self.btn_next, 1)
+        lay.addLayout(step)
+
+        tip = QtWidgets.QLabel("点三维上的面、拖轨道，或用按钮单步切换。")
         tip.setObjectName("Hint")
         tip.setWordWrap(True)
         lay.addWidget(tip)
@@ -311,29 +352,18 @@ class MainWindow(QtWidgets.QMainWindow):
     def _card_playback(self) -> QtWidgets.QFrame:
         card, lay = make_panel("扫掠播放")
 
-        row = QtWidgets.QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
-        self.btn_prev = QtWidgets.QPushButton("◀")
-        self.btn_prev.setFixedWidth(38)
-        self.btn_prev.clicked.connect(lambda: self._step(-1))
-        self.btn_next = QtWidgets.QPushButton("▶")
-        self.btn_next.setFixedWidth(38)
-        self.btn_next.clicked.connect(lambda: self._step(1))
         self.btn_play = QtWidgets.QPushButton("▶  播放")
         self.btn_play.setObjectName("Play")
+        self.btn_play.setToolTip("从当前切片开始连续扫掠，看同相轴的横向连续性")
         self.btn_play.clicked.connect(self._toggle_play)
-        row.addWidget(self.btn_prev)
-        row.addWidget(self.btn_play, 1)
-        row.addWidget(self.btn_next)
-        lay.addLayout(row)
+        lay.addWidget(self.btn_play)
 
         row2 = QtWidgets.QHBoxLayout()
         row2.setContentsMargins(0, 0, 0, 0)
         row2.setSpacing(8)
         lab = QtWidgets.QLabel("速度")
         lab.setObjectName("Hint")
-        self.speed_combo = QtWidgets.QComboBox()
+        self.speed_combo = WheelSafeComboBox()
         for name, interval in SPEEDS:
             self.speed_combo.addItem(name, interval)
         self.speed_combo.setCurrentIndex(1)
@@ -365,7 +395,7 @@ class MainWindow(QtWidgets.QMainWindow):
         r2.setSpacing(8)
         lab2 = QtWidgets.QLabel("色标上限")
         lab2.setObjectName("Hint")
-        self.clim_combo = QtWidgets.QComboBox()
+        self.clim_combo = WheelSafeComboBox()
         for name, key in CLIM_MODES:
             self.clim_combo.addItem(name, key)
         self.clim_combo.currentIndexChanged.connect(self._on_clim_mode)
@@ -391,13 +421,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_agc = QtWidgets.QCheckBox("自动增益 AGC（按道归一化）")
         self.chk_agc.setToolTip("按道做滑动窗口 RMS 归一化，把深浅部的能量拉到同一量级")
         self.chk_agc.toggled.connect(lambda _v: self._refresh_all())
+        self.chk_agc.toggled.connect(self._sync_display_enabled)
         lay.addWidget(self.chk_agc)
         row = QtWidgets.QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
         lab3 = QtWidgets.QLabel("AGC 窗口")
         lab3.setObjectName("Hint")
-        self.spin_agc = QtWidgets.QSpinBox()
+        self.spin_agc = WheelSafeSpinBox()
         self.spin_agc.setRange(0, 1001)
         self.spin_agc.setValue(0)
         self.spin_agc.setSpecialValueText("整道")
@@ -410,9 +441,12 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(lab3)
         row.addWidget(self.spin_agc, 1)
         lay.addLayout(row)
+        self._agc_widgets = [lab3, self.spin_agc]
 
         self.chk_wiggle = QtWidgets.QCheckBox("叠加波形（wiggle）")
+        self.chk_wiggle.setToolTip("在剖面上叠加波形曲线，看同相轴的形状与极性")
         self.chk_wiggle.toggled.connect(lambda _v: self._refresh_all())
+        self.chk_wiggle.toggled.connect(self._sync_display_enabled)
         lay.addWidget(self.chk_wiggle)
 
         row = QtWidgets.QHBoxLayout()
@@ -420,7 +454,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row.setSpacing(8)
         lab5 = QtWidgets.QLabel("波形道数")
         lab5.setObjectName("Hint")
-        self.spin_wig = QtWidgets.QSpinBox()
+        self.spin_wig = WheelSafeSpinBox()
         self.spin_wig.setRange(1, 300)
         self.spin_wig.setValue(60)
         self.spin_wig.valueChanged.connect(lambda _v: self._refresh_all())
@@ -428,7 +462,7 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.spin_wig, 1)
         lab5b = QtWidgets.QLabel("颜色")
         lab5b.setObjectName("Hint")
-        self.combo_wig_color = QtWidgets.QComboBox()
+        self.combo_wig_color = WheelSafeComboBox()
         for name, rgba in WIGGLE_COLORS:
             self.combo_wig_color.addItem(name, rgba)
         self.combo_wig_color.setToolTip(
@@ -444,13 +478,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gain.slider.setValue(100)
         self.gain.valueChanged.connect(lambda _v: self._refresh_all())
         lay.addWidget(self.gain)
+        self._wig_widgets = [lab5, self.spin_wig, lab5b, self.combo_wig_color, self.gain]
 
         row = QtWidgets.QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
         lab4 = QtWidgets.QLabel("渲染抽稀")
         lab4.setObjectName("Hint")
-        self.combo_dec = QtWidgets.QComboBox()
+        self.combo_dec = WheelSafeComboBox()
         for name, limit in DOWNSAMPLE:
             self.combo_dec.addItem(name, limit)
         self.combo_dec.setCurrentIndex(2)
@@ -459,7 +494,19 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(lab4)
         row.addWidget(self.combo_dec, 1)
         lay.addLayout(row)
+        self._sync_display_enabled()
         return card
+
+    def _sync_display_enabled(self) -> None:
+        """只让"当前真正生效"的参数可编辑。
+
+        AGC 没勾时改窗口、wiggle 没勾时改道数，都是白改 —— 灰掉比让人以为
+        改错了更清楚。
+        """
+        for w in getattr(self, "_agc_widgets", []):
+            w.setEnabled(self.chk_agc.isChecked())
+        for w in getattr(self, "_wig_widgets", []):
+            w.setEnabled(self.chk_wiggle.isChecked())
 
     # -------------------------------------------------------------- 中间
     def _build_center(self) -> QtWidgets.QSplitter:
@@ -754,9 +801,68 @@ class MainWindow(QtWidgets.QMainWindow):
         vol = build_sample_volume()
         self._set_volume(vol)
         self.src_info.setText(
-            f"当前：{vol.name}\n{vol.ns} 炮 × {vol.nr} 检波点 × {vol.nt} 采样\n"
-            f"4 个反射层 + 2 个绕射点，可检验显示是否正确。")
+            f"示例数据　{vol.ns} 炮 × {vol.nr} 检波点 × {vol.nt} 采样\n"
+            f"dt {vol.dt * 1000:g} ms　4 个反射层 + 2 个绕射点")
         self.status.setText("已载入示例数据。")
+
+    # ============================================================== 导出 / 转换
+    def export_volume(self) -> None:
+        """把当前体数据导出成矩阵（npy / npz / mat）或写成 SEG-Y / SU。"""
+        vol = self.vol
+        if vol is None:
+            self.status.setText("请先打开数据或载入示例，再导出。")
+            return
+        src = Path(self.path) if self.path else None
+        dlg = ExportDialog(vol, src.parent if src else Path.home(),
+                           src.stem if src else "seisview_export", self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            self.status.setText("已取消导出。")
+            return
+        self._run_export(dlg)
+
+    def _run_export(self, dlg) -> None:
+        """带进度与取消地跑一次导出。"""
+        vol = self.vol
+        path, fmt = dlg.path(), dlg.fmt()
+        prog = QtWidgets.QProgressDialog("正在导出…", "取消", 0, 100, self)
+        prog.setWindowTitle("导出 / 转换")
+        prog.setWindowModality(QtCore.Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(300)
+        prog.setAutoClose(False)
+        prog.setAutoReset(False)
+        prog.setValue(0)
+        last = [-1]
+
+        def on_progress(frac: float, text: str) -> None:
+            pct = int(max(0.0, min(1.0, frac)) * 100)
+            if pct == last[0]:                  # 别为了报进度把事件循环淹了
+                return
+            last[0] = pct
+            prog.setValue(pct)
+            prog.setLabelText(text)
+            QtWidgets.QApplication.processEvents()
+
+        self._stop()
+        try:
+            out = exporter.export(path, vol.data, fmt,
+                                  dt_us=dlg.dt_us(), dx=dlg.dx(), ds=dlg.ds(),
+                                  with_coords=dlg.with_coords(),
+                                  progress=on_progress,
+                                  cancel=prog.wasCanceled)
+        except exporter.ExportError as exc:
+            prog.close()
+            self._error("导出失败", str(exc))
+            return
+        except Exception as exc:                            # pragma: no cover
+            prog.close()
+            self._error("导出失败", f"{type(exc).__name__}: {exc}")
+            return
+        prog.setValue(100)
+        prog.close()
+        size = Path(out).stat().st_size
+        self.status.setText(
+            f"已导出 {exporter.LABEL_OF.get(fmt, fmt)} → {out}"
+            f"（{size / 1024 ** 2:.1f} MB）")
 
     # ================================================================== 装配
     def _set_volume(self, vol: SeisVolume) -> None:
@@ -764,11 +870,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.vol = vol
         self.pos = {"shot": vol.ns // 2, "recv": vol.nr // 2, "time": max(0, vol.nt // 4)}
         self.trace = (self.pos["shot"], self.pos["recv"])
-        # 只有一个切片可选的方向没有扫掠意义，直接禁用；默认落在第一个可用的方向
-        usable = [m for m in ("shot", "recv", "time") if vol.slice_index_range(m) > 1]
-        self.mode = usable[0] if usable else "time"
-        self.mode_ctl.set_enabled_keys(set(usable))
+        # 三种面都可以直接展示 —— 二维数据（只有一炮）也该能点"共炮点"看整幅剖面，
+        # 原先按"可扫掠切片数 > 1"禁用模式，导致 1×R×T 的数据点不到共炮点面。
+        # 默认落在"成像面积最大"的那一面：二维数据是共炮点面（整幅剖面），
+        # 三维数据也是共炮点面（一个完整炮集），比"第一个可用方向"更自然。
+        areas = {"shot": vol.nr * vol.nt, "recv": vol.ns * vol.nt,
+                 "time": vol.ns * vol.nr}
+        self.mode = max(areas, key=lambda m: areas[m])
+        self.mode_ctl.set_enabled_keys({"shot", "recv", "time"})
         self.mode_ctl.set_value(self.mode)
+        self.btn_export.setEnabled(True)
 
         self._recompute_base_clim()
         if self.view3d is not None:
@@ -957,6 +1068,25 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         n = self.vol.slice_index_range(self.mode)
         self._on_slice_index((self.pos[self.mode] + delta) % n)
+
+    def _apply_scales(self) -> None:
+        """dt / dx / ds 改完立刻生效。
+
+        原先这三个框改了没有任何反应，必须重新载入变量才看得到差别 —— 尤其是
+        SEG-Y 的 dt 来自道头、默认值 0.001 往往是错的，用户改成真实值后却看不到
+        时间轴变化，很容易以为程序算错了。
+        """
+        vol = self.vol
+        if vol is None:
+            return
+        dt = float(self.spin_dt.value())
+        dx = float(self.spin_dx.value())
+        ds = float(self.spin_ds.value())
+        if (dt, dx, ds) == (vol.dt, vol.dx, vol.ds):
+            return
+        vol.dt, vol.dx, vol.ds = dt, dx, ds
+        self._refresh_all(sync_controls=False)
+        self.status.setText(f"标尺已更新：dt {dt:g} s　dx {dx:g} m　ds {ds:g} m")
 
     def _on_cmap(self) -> None:
         self._refresh_all()

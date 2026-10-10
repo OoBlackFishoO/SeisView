@@ -166,6 +166,19 @@ QSpinBox, QDoubleSpinBox {{
 }}
 QSpinBox:focus, QDoubleSpinBox:focus {{ border-color: {ACCENT}; }}
 
+/* --------------------------------------------------------------- 输入框 */
+QLineEdit {{
+    background-color: {CARD};
+    border: 1px solid {LINE};
+    border-radius: 4px;
+    padding: 4px 8px;
+    min-height: 18px;
+    selection-background-color: {ACCENT_DIM};
+}}
+QLineEdit:hover {{ border-color: {LINE_HI}; }}
+QLineEdit:focus {{ border-color: {ACCENT}; }}
+QLineEdit:read-only {{ color: {TEXT_DIM}; }}
+
 /* ---------------------------------------------------------------- 滑块 */
 QSlider::groove:horizontal {{
     height: 2px;

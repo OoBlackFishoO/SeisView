@@ -12,6 +12,13 @@
 "levels argument is required for float input types" 抛异常，绘制直接中断 ——
 表现就是切换切片模式后整块面板全黑，滚动缩放一次（缩放系数回到 1，不再降采样）
 才恢复。我们自己已经在 ``volume.decimate`` 里按屏幕像素抽过稀了，不需要它再插一手。
+
+交互
+----
+* 左键拖动 = 平移，滚轮 = 缩放（用 ``PanMode``；原来的 ``RectMode`` 是"框起来放大"，
+  看剖面时更想直接拖着走）；
+* 左键"按下-抬起几乎没动"才算取点，否则拖完顺手把单道波形换掉了；
+* 双击复位视野。
 """
 
 from __future__ import annotations
@@ -24,6 +31,9 @@ from . import render, style
 
 # 叠加波形的默认颜色：地震剖面上惯用黑色（底色多为白/红/蓝，黑色最跳）
 _DEFAULT_WIGGLE_COLOR = (10, 12, 16, 210)
+
+# 判定"点击"（而非拖动）的位移上限，单位像素
+_CLICK_SLOP = 4
 
 
 # 单道波形取自哪一道的提示线用**竖线**（angle=90）。
@@ -46,7 +56,7 @@ class SliceView(pg.PlotWidget):
         vb = self.getViewBox()
         vb.setDefaultPadding(0.0)
         vb.invertY(True)
-        vb.setMouseMode(pg.ViewBox.RectMode)
+        vb.setMouseMode(pg.ViewBox.PanMode)     # 左键拖动平移，滚轮缩放
 
         self._img = pg.ImageItem(axisOrder="row-major", autoDownsample=False)
         self.addItem(self._img)
@@ -66,6 +76,7 @@ class SliceView(pg.PlotWidget):
         self._full = (0, 0)       # 抽稀前的原始网格尺寸
         self._extent = (0.0, 1.0, 0.0, 1.0)
         self._wiggle_color = _DEFAULT_WIGGLE_COLOR
+        self._press: QtCore.QPointF | None = None
 
     # ------------------------------------------------------------ 数据
     def set_slice(self, img: np.ndarray, extent: tuple[float, float, float, float],
@@ -76,6 +87,9 @@ class SliceView(pg.PlotWidget):
                   wiggle_color: tuple[int, int, int, int] | None = None) -> np.ndarray:
         """显示一个切片；``full_shape`` 是抽稀前的原始尺寸，用于把点击位置映射回原网格。"""
         rows, cols = img.shape
+        # 几何没变（同一模式换切片、只改色标/AGC/wiggle）时**不能**重置视野，
+        # 否则放大看细节时一调参数就被拉回全图。只有换了一整幅几何才复位。
+        same_geom = self._extent == extent and self._shape[0] > 0
         self._shape = (rows, cols)
         self._full = full_shape or (rows, cols)
         self._extent = extent
@@ -86,17 +100,24 @@ class SliceView(pg.PlotWidget):
         x0, x1, y0, y1 = extent
         self._img.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
 
-        # 先只设范围限制，再用一次 setRange 把 X/Y 一起定下来。
-        # 分两次 setXRange/setYRange 时，中间那一瞬间的范围可能不合法
-        # （尤其在不同模式之间跨度相差上千倍时），会把视图留在错误状态。
+        if not same_geom:
+            self._fit_range()
+        self.setLabel("bottom", xlabel)
+        self.setLabel("left", ylabel)
+        self._update_wiggles(img, wiggle, gain, clim)
+
+    def _fit_range(self) -> None:
+        """把视野复位到整幅数据。
+
+        先一次性设好范围限制再 setRange：分两次 setXRange/setYRange 时，
+        中间那一瞬间的范围可能不合法（尤其在不同模式之间跨度相差上千倍时），
+        会把视图留在错误状态。
+        """
+        x0, x1, y0, y1 = self._extent
         vb = self.getViewBox()
         vb.setLimits(xMin=x0, xMax=x1, yMin=y0, yMax=y1)
         vb.disableAutoRange()
         vb.setRange(rect=QtCore.QRectF(x0, y0, x1 - x0, y1 - y0), padding=0.0)
-
-        self.setLabel("bottom", xlabel)
-        self.setLabel("left", ylabel)
-        self._update_wiggles(img, wiggle, gain, clim)
 
     def slice_shape(self) -> tuple[int, int]:
         return self._shape
@@ -133,11 +154,31 @@ class SliceView(pg.PlotWidget):
             self.hovered.emit(cell[0], cell[1])
 
     def mousePressEvent(self, ev) -> None:
-        if ev.button() == QtCore.Qt.MouseButton.LeftButton and self._shape[0]:
+        self._press = (ev.position()
+                       if ev.button() == QtCore.Qt.MouseButton.LeftButton and self._shape[0]
+                       else None)
+        super().mousePressEvent(ev)            # 交给 ViewBox 做平移
+
+    def mouseReleaseEvent(self, ev) -> None:
+        """左键"按下-抬起几乎没动"才算取点。
+
+        拖动是平移，若在按下时就取点，每次拖完都会顺手把下方单道波形换掉。
+        """
+        pressed, self._press = self._press, None
+        if (pressed is not None
+                and ev.button() == QtCore.Qt.MouseButton.LeftButton
+                and (ev.position() - pressed).manhattanLength() <= _CLICK_SLOP):
             cell = self._to_cell(self.mapToView(ev.position()))
             if cell is not None:
                 self.picked.emit(cell[0], cell[1])
-        super().mousePressEvent(ev)
+        super().mouseReleaseEvent(ev)
+
+    def mouseDoubleClickEvent(self, ev) -> None:
+        """双击复位视野（放大看细节之后不用去别处找按钮）。"""
+        if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._press = None                 # 别让随后的 release 又取一次点
+            self._fit_range()
+        super().mouseDoubleClickEvent(ev)
 
     def set_reference(self, value: float | None, text: str | None = None) -> None:
         """在剖面上标出下方单道波形取自哪一道。

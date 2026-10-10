@@ -2,13 +2,42 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from . import export as exporter
 from . import render, style
 from .loaders import VariableInfo, guess_roles, role_options
 from .volume import ROLE_LABELS, ROLE_RECV, ROLE_SHOT, ROLE_TIME
+
+
+# ============================================================ 滚轮安全控件
+class _NoWheelMixin:
+    """禁止用滚轮改值。
+
+    左栏是滚动区，鼠标扫过下拉框/数字框时很容易顺手把参数改掉（尤其是抽稀、
+    AGC 窗口这种一改就重绘的项）。这里用 ``ev.ignore()`` 让事件继续往上传给
+    父控件 —— 滚动区照常滚动，而值不变；直接"吞掉"事件会让滚轮在控件上失灵，
+    体验反而更差。
+    """
+
+    def wheelEvent(self, ev) -> None:                        # noqa: N802 (Qt 命名)
+        ev.ignore()
+
+
+class WheelSafeComboBox(_NoWheelMixin, QtWidgets.QComboBox):
+    """下拉框：滚轮不改值。"""
+
+
+class WheelSafeSpinBox(_NoWheelMixin, QtWidgets.QSpinBox):
+    """整数框：滚轮不改值。"""
+
+
+class WheelSafeDoubleSpinBox(_NoWheelMixin, QtWidgets.QDoubleSpinBox):
+    """浮点框：滚轮不改值。"""
 
 # ==================================================================== 小标题
 class SectionLabel(QtWidgets.QLabel):
@@ -240,7 +269,7 @@ class PlayheadTrack(QtWidgets.QWidget):
 
 
 # ==================================================================== 色带选择
-class ColormapCombo(QtWidgets.QComboBox):
+class ColormapCombo(WheelSafeComboBox):
     """下拉项带渐变缩略图，比纯文字更容易选。"""
 
     def __init__(self, parent=None):
@@ -359,7 +388,7 @@ class AxisOrderDialog(QtWidgets.QDialog):
             lab.setObjectName("Hint")
             length = QtWidgets.QLabel(f"长度 {n}")
             length.setObjectName("Value")
-            box = QtWidgets.QComboBox()
+            box = WheelSafeComboBox()
             box.addItems(opts)
             if i < len(roles):
                 box.setCurrentText(ROLE_LABELS.get(roles[i], "忽略"))
@@ -577,6 +606,227 @@ class ArrayViewDialog(QtWidgets.QDialog):
                 lines.append(str(v))
         QtWidgets.QApplication.clipboard().setText("\n".join(lines))
         self.status.setText(f"已复制 {len(lines)} 个数值到剪贴板")
+
+
+# ==================================================================== 导出对话框
+class ExportDialog(QtWidgets.QDialog):
+    """导出 / 转换：把当前体数据写成矩阵，或重写成 SEG-Y / SU。
+
+    两种目标的性质差别很大，所以这里把取舍写在明面上：
+    矩阵格式只写数据、不带标尺；SEG-Y / SU 会**合成**一套最小但正确的道头
+    （不是复制源文件的道头）。
+    """
+
+    def __init__(self, volume, default_dir, default_stem: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("导出 / 转换")
+        self.setModal(True)
+        self.setMinimumWidth(540)
+        self._vol = volume
+        self._dir = str(default_dir)
+        self._stem = default_stem
+        self._suffixes = set(exporter.SUFFIX_OF.values())
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(10)
+
+        head = QtWidgets.QLabel(f"导出体数据　{volume.name}")
+        head.setObjectName("Title")
+        head.setWordWrap(True)
+        root.addWidget(head)
+
+        # ---- 格式
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        lab = QtWidgets.QLabel("目标格式")
+        lab.setObjectName("Hint")
+        self.combo_fmt = WheelSafeComboBox()
+        for name, key in exporter.EXPORT_FORMATS:
+            self.combo_fmt.addItem(name, key)
+        self.combo_fmt.currentIndexChanged.connect(self._on_format)
+        row.addWidget(lab)
+        row.addWidget(self.combo_fmt, 1)
+        root.addLayout(row)
+
+        # ---- 路径
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        lab = QtWidgets.QLabel("保存到")
+        lab.setObjectName("Hint")
+        self.path_edit = QtWidgets.QLineEdit()
+        self.path_edit.setMinimumWidth(300)
+        btn_browse = QtWidgets.QPushButton("浏览…")
+        btn_browse.setObjectName("Ghost")
+        btn_browse.clicked.connect(self._browse)
+        row.addWidget(lab)
+        row.addWidget(self.path_edit, 1)
+        row.addWidget(btn_browse)
+        root.addLayout(row)
+
+        # ---- 规模 / 提示
+        self.scale_label = QtWidgets.QLabel("")
+        self.scale_label.setObjectName("Hint")
+        self.scale_label.setWordWrap(True)
+        root.addWidget(self.scale_label)
+
+        self.note_label = QtWidgets.QLabel("")
+        self.note_label.setObjectName("Hint")
+        self.note_label.setWordWrap(True)
+        root.addWidget(self.note_label)
+
+        # ---- SEG-Y / SU 专用参数
+        self.seis_box = QtWidgets.QFrame()
+        self.seis_box.setObjectName("Panel")
+        sbox = QtWidgets.QVBoxLayout(self.seis_box)
+        sbox.setContentsMargins(12, 10, 12, 10)
+        sbox.setSpacing(7)
+        sbox.addWidget(SectionLabel("道头参数（合成）"))
+
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+        dt_us = int(round(volume.dt * 1e6)) or 1000
+        self.spin_dt_us = WheelSafeSpinBox()
+        self.spin_dt_us.setRange(1, 65535)
+        self.spin_dt_us.setValue(min(65535, max(1, dt_us)))
+        self.spin_dt_us.setSuffix(" µs")
+        self.spin_dt_us.setMinimumWidth(110)
+        self.spin_dx = WheelSafeDoubleSpinBox()
+        self.spin_dx.setRange(0.0, 1e6)
+        self.spin_dx.setDecimals(3)
+        self.spin_dx.setValue(float(volume.dx))
+        self.spin_dx.setSuffix(" m")
+        self.spin_dx.setMinimumWidth(110)
+        self.spin_ds = WheelSafeDoubleSpinBox()
+        self.spin_ds.setRange(0.0, 1e6)
+        self.spin_ds.setDecimals(3)
+        self.spin_ds.setValue(float(volume.ds))
+        self.spin_ds.setSuffix(" m")
+        self.spin_ds.setMinimumWidth(110)
+        for i, (name, w, tip) in enumerate([
+                ("采样间隔", self.spin_dt_us, "写入二进制头与每道道头（TRACE_SAMPLE_INTERVAL）"),
+                ("检波器间距 dx", self.spin_dx, "只在勾选下面「写入空间坐标」时使用"),
+                ("炮点间距 ds", self.spin_ds, "只在勾选下面「写入空间坐标」时使用")]):
+            lb = QtWidgets.QLabel(name)
+            lb.setObjectName("Hint")
+            lb.setToolTip(tip)
+            w.setToolTip(tip)
+            grid.addWidget(lb, i, 0)
+            grid.addWidget(w, i, 1)
+        sbox.addLayout(grid)
+
+        self.chk_coords = QtWidgets.QCheckBox("写入空间坐标（SourceX / GroupX / offset）")
+        self.chk_coords.setChecked(True)
+        self.chk_coords.setToolTip(
+            "勾选后按规则合成几何：\n"
+            "SourceX = 炮号 × ds\n"
+            "GroupX  = 炮号 × ds + 道号 × dx\n"
+            "offset  = 道号 × dx\n"
+            "三者自洽（offset == GroupX − SourceX）。\n"
+            "dx 带小数时会写入坐标标量（SourceGroupScalar），避免小数被取整。")
+        sbox.addWidget(self.chk_coords)
+
+        self.seis_note = QtWidgets.QLabel(
+            "道头按规则合成：FieldRecord = 炮号 + 1、TraceNumber = 道号 + 1、\n"
+            "TRACE_SAMPLE_COUNT、TRACE_SAMPLE_INTERVAL；采样格式写 IEEE float32（格式码 5）。\n"
+            "源文件原有的其它道头字段（CDP、高程、日期等）不会被带过来。")
+        self.seis_note.setObjectName("Hint")
+        self.seis_note.setWordWrap(True)
+        sbox.addWidget(self.seis_note)
+        root.addWidget(self.seis_box)
+
+        self.error = QtWidgets.QLabel("")
+        self.error.setStyleSheet(f"color: {style.ERR};")
+        self.error.setWordWrap(True)
+        root.addWidget(self.error)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.StandardButton.Ok
+            | QtWidgets.QDialogButtonBox.StandardButton.Cancel)
+        self._ok = btns.button(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        self._ok.setText("导出")
+        self._ok.setObjectName("Primary")
+        btns.button(QtWidgets.QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        btns.accepted.connect(self._validate)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+        self._on_format()
+
+    # ---------------------------------------------------------------- 取值
+    def fmt(self) -> str:
+        return self.combo_fmt.currentData() or "npy"
+
+    def path(self) -> str:
+        return self.path_edit.text().strip()
+
+    def dt_us(self) -> int:
+        return int(self.spin_dt_us.value())
+
+    def dx(self) -> float:
+        return float(self.spin_dx.value())
+
+    def ds(self) -> float:
+        return float(self.spin_ds.value())
+
+    def with_coords(self) -> bool:
+        return self.chk_coords.isChecked()
+
+    # ---------------------------------------------------------------- 交互
+    def _on_format(self) -> None:
+        fmt = self.fmt()
+        seis = fmt in exporter.SEISMIC_KEYS
+        self.seis_box.setVisible(seis)
+
+        cur = self.path()
+        p = Path(cur) if cur else None
+        if p is None or p.suffix.lower() not in self._suffixes:
+            p = Path(self._dir) / (self._stem + exporter.SUFFIX_OF[fmt])
+        else:
+            p = p.with_suffix(exporter.SUFFIX_OF[fmt])
+        self.path_edit.setText(str(p))
+
+        self.scale_label.setText(exporter.describe(self._vol.data, fmt))
+        if seis:
+            self.note_label.setText(
+                "SEG-Y / SU 是「逐道带道头」的格式，立方体是个抽象网格，\n"
+                "所以这里会合成一套最小但正确的道头，保证任何软件都能正确定位与分选。")
+        else:
+            self.note_label.setText(
+                "⚠ 只导出数据矩阵：不含 dt / dx / ds 等元信息（标尺会丢），\n"
+                "缺道位置以 0 填充，因此下游无法区分「真 0」与「缺道」。\n"
+                "数据形状 S × R × T = 炮 × 检波器 × 时间，未做任何显示相关的处理。")
+        self.error.setText("")
+
+    def _browse(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "导出到", self.path(),
+            f"{self.combo_fmt.currentText()} (*{exporter.SUFFIX_OF[self.fmt()]});;所有文件 (*)")
+        if path:
+            if not Path(path).suffix:
+                path += exporter.SUFFIX_OF[self.fmt()]
+            self.path_edit.setText(path)
+
+    def _validate(self) -> None:
+        path = self.path()
+        if not path:
+            self.error.setText("请先指定保存路径。")
+            return
+        p = Path(path)
+        if p.parent and not p.parent.exists():
+            self.error.setText(f"目录不存在：{p.parent}")
+            return
+        if p.exists():
+            ans = QtWidgets.QMessageBox.question(
+                self, "覆盖确认", f"{p.name} 已存在，覆盖吗？",
+                QtWidgets.QMessageBox.StandardButton.Yes
+                | QtWidgets.QMessageBox.StandardButton.No)
+            if ans != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+        self.accept()
 
 
 # ==================================================================== 部件容器
