@@ -9,6 +9,8 @@ venv/
 build/
 dist/
 *.manifest
+# Release 用的免安装压缩包（应该传到 Release 附件，不是仓库）
+SeisView-*.zip
 
 # 演示数据由 make_sample.py 生成，不进仓库
 sample_data/
