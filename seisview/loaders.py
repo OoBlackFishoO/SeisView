@@ -415,8 +415,6 @@ def _seismic_summary(p: Path, info: dict) -> str:
         lines.append(f"{info['holes']} 炮存在缺道（{where}）")
     if info["short"] and not info["holes"]:
         lines.append(f"{info['short']} 炮道数少于最多炮（{info['n_r']}），末尾补零")
-    if not (info["holes"] or info["short"] or not info["by_tracl"]):
-        lines.append("各炮道数一致，无缺道")
     lines.append(
         f"偏移距 {info['off_range'][0]:.6g} ~ {info['off_range'][1]:.6g}"
         f"（前 {info['probed']} 道抽样）　"
@@ -424,7 +422,7 @@ def _seismic_summary(p: Path, info: dict) -> str:
            if info["dx_ok"] and info["ds_ok"] else
            "道头坐标未能给出可信间距，横轴按道序号/炮序号显示"))
     if info["store_dtype"]:
-        lines.append("数据按需读取（mmap 惰性），只把要看的那一片读进内存")
+        lines.append("数据按需读取，不会整卷载入内存")
     lines.append("R 轴 = 炮内道序（非物理检波点坐标）；时间切片是 (炮号, 道号) 索引平面")
     return "\n".join(lines)
 

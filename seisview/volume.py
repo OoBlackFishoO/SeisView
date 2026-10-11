@@ -169,17 +169,23 @@ def agc(arr: np.ndarray, window: int = 0, axis: int = 0) -> np.ndarray:
     flip = bool(axis)
     if flip:
         a = np.ascontiguousarray(a.T)
+    # 坏点（NaN / Inf）不参与能量统计，否则一个坏点会把整条道（滑窗时甚至是
+    # 半个窗口的道）都算成 NaN，画面上就是一整片空洞。它自己仍然是坏点。
+    valid = np.isfinite(a)
+    filled = np.where(valid, a, 0.0).astype(np.float32)
     if window is None or window <= 1:
-        scale = np.sqrt(np.mean(a * a, axis=0, keepdims=True))
+        scale = np.sqrt(np.mean(filled * filled, axis=0, keepdims=True))
     else:
         w = int(window) | 1                     # 强制奇数，保证下面长度对齐
         pad = (w - 1) // 2
-        power = np.pad(a * a, ((pad, pad), (0, 0)), mode="edge")
+        power = np.pad(filled * filled, ((pad, pad), (0, 0)), mode="edge")
         cum = np.cumsum(power, axis=0)
         cum = np.vstack([np.zeros((1, cum.shape[1]), cum.dtype), cum])
         scale = np.sqrt(np.maximum((cum[w:] - cum[:-w]) / w, 1e-30))
     scale[scale == 0] = 1.0
-    out = (a / scale).astype(np.float32)
+    out = (filled / scale).astype(np.float32)
+    if not valid.all():
+        out = np.where(valid, out, np.nan).astype(np.float32)
     return np.ascontiguousarray(out.T) if flip else out
 
 
@@ -188,17 +194,27 @@ def compute_clim(arr: np.ndarray, mode: str = "auto", value: float = 1.0,
                  sigma: float = 8.0) -> tuple[float, float]:
     """计算色标上下限。
 
-    auto   —— 中位数 + sigma×MAD。MAD 反映的是数据的"安静部分"（噪声底），
-              与个别强反射无关，因此乘一个较大的系数（默认 8）就能让噪声底
-              接近色标中性的白色，而反射同相轴依旧被压到饱和，图像最干净。
+    auto   —— 中位数 + sigma×MAD，但用 |x| 的 95% 分位数兜底。
+              MAD 反映数据"安静部分"（噪声底）的宽度，与个别强反射无关，乘一个
+              较大系数就能让噪声底接近色标中性的白色、让同相轴饱和，图像最干净；
+              但它对**重尾分布**失效：实测某真实记录（1024×901）中位数附近的
+              MAD 只有 0.0023，8σ 后上限 0.028，而 5% 的样点幅度已在 0.27 以上——
+              结果 20% 的样点被压成纯红/纯蓝，看上去"对比度爆表"。
+              所以用 P95(|x|) 作为下界：无论数据多"重尾"，最多只截断 5%。
     robust —— 分位数 2% / 98%
     manual —— 对称取 ±value
+
+    NaN / Inf 一律不参与统计：`np.median` 会把中间值本身变成 NaN，一个坏点就能让
+    整个窗口失效（整幅图变成一块纯色）。坏点位置交给渲染层单独画成"洞"。
     """
     if arr.size == 0:
         return (-1.0, 1.0)
     if mode == "manual":
         return (-abs(value), abs(value))
     sample = arr[:: max(1, arr.size // 200_000)]
+    sample = sample[np.isfinite(sample)]
+    if sample.size == 0:                       # 全是坏点：跟空数据一样兜底
+        return (-1.0, 1.0)
     if mode == "robust":
         lo, hi = np.percentile(sample, [2.0, 98.0])
         v = max(abs(float(lo)), abs(float(hi)), 1e-30)
@@ -206,17 +222,26 @@ def compute_clim(arr: np.ndarray, mode: str = "auto", value: float = 1.0,
     med = float(np.median(sample))
     mad = float(np.median(np.abs(sample - med)))
     v = 1.4826 * mad * sigma
+    floor = float(np.percentile(np.abs(sample), 95.0))
+    if not np.isfinite(v) or v <= 0:
+        v = floor
+    v = max(v, floor)
     if not np.isfinite(v) or v <= 0:
         v = float(np.max(np.abs(sample))) or 1.0
     return (med - v, med + v)
 
 
 def stats(arr: np.ndarray) -> dict:
+    """当前显示数据的四个读数。坏点不算进去，免得整行都显示 nan。"""
     if arr.size == 0:
         return {"min": 0.0, "max": 0.0, "mean": 0.0, "rms": 0.0}
+    values = np.asarray(arr, dtype=np.float64).ravel()
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {"min": 0.0, "max": 0.0, "mean": 0.0, "rms": 0.0}
     return {
-        "min": float(np.min(arr)),
-        "max": float(np.max(arr)),
-        "mean": float(np.mean(arr)),
-        "rms": float(np.sqrt(np.mean(arr.astype(np.float64) ** 2))),
+        "min": float(values.min()),
+        "max": float(values.max()),
+        "mean": float(values.mean()),
+        "rms": float(np.sqrt(np.mean(values ** 2))),
     }

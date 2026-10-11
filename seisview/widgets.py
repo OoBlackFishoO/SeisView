@@ -39,6 +39,14 @@ class WheelSafeSpinBox(_NoWheelMixin, QtWidgets.QSpinBox):
 class WheelSafeDoubleSpinBox(_NoWheelMixin, QtWidgets.QDoubleSpinBox):
     """浮点框：滚轮不改值。"""
 
+
+class WheelSafeSlider(_NoWheelMixin, QtWidgets.QSlider):
+    """滑杆：滚轮不改值。
+
+    左栏本来就有好几条滑杆（切片位置、对比度、波形幅度），鼠标扫过时很容易
+    被滚轮顺手拖走 —— 而且滑杆的"滚动"没有任何视觉提示，比下拉框更隐蔽。
+    """
+
 # ==================================================================== 小标题
 class SectionLabel(QtWidgets.QLabel):
     def __init__(self, text: str, parent=None):
@@ -121,12 +129,18 @@ class SegmentedControl(QtWidgets.QWidget):
 
 # ==================================================================== 滑杆行
 class SliderRow(QtWidgets.QWidget):
-    """标题 + 滑杆 + 等宽读数。"""
+    """标题 + 滑杆（可选精细输入框）。
+
+    ``spin=True`` 时在滑杆**左侧**给一个可键入的数字框：滑杆拖不准，尤其
+    对比度、波形幅度这类要精确复现的设定，有个能敲数值的地方顺手得多。
+    两者双向同步，改动任一边都会发 ``valueChanged``。
+    """
 
     valueChanged = QtCore.Signal(int)
     released = QtCore.Signal(int)
 
-    def __init__(self, title: str, parent=None):
+    def __init__(self, title: str, parent=None, *, spin: bool = False,
+                 suffix: str = ""):
         super().__init__(parent)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -140,27 +154,82 @@ class SliderRow(QtWidgets.QWidget):
         self.readout.setFont(style.mono_font(9))
         head.addWidget(self.title)
         head.addStretch(1)
-        head.addWidget(self.readout)
+        # 有精细输入框时不再单占一行读数：两个同值的数字只会显得啰嗦
+        if not spin:
+            head.addWidget(self.readout)
         lay.addLayout(head)
 
-        self._suffix = ""
-        self.slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self._suffix = suffix
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self.editor: WheelSafeSpinBox | None = None
+        if spin:
+            self.editor = WheelSafeSpinBox()
+            self.editor.setRange(0, 0)
+            self.editor.setSuffix(suffix)
+            self.editor.setFixedWidth(70)
+            self.editor.setKeyboardTracking(False)   # 回车/失焦才提交，免得边敲边重绘
+            self.editor.valueChanged.connect(self._on_editor)
+            row.addWidget(self.editor)
+        self.slider = WheelSafeSlider(QtCore.Qt.Orientation.Horizontal)
         self.slider.setRange(0, 0)
         self.slider.valueChanged.connect(self._on_change)
         self.slider.sliderReleased.connect(lambda: self.released.emit(self.slider.value()))
-        lay.addWidget(self.slider)
+        row.addWidget(self.slider, 1)
+        lay.addLayout(row)
+        self._sync_editor(0)
+
+    def _sync_editor(self, v: int) -> None:
+        if self.editor is None:
+            return
+        self.editor.blockSignals(True)
+        self.editor.setValue(int(v))
+        self.editor.blockSignals(False)
+
+    def set_tooltip(self, text: str) -> None:
+        """整行设置提示。
+
+        这一行由标题、滑杆（可能还有数字框）拼成，鼠标通常落在子控件上；
+        只对自己的空白处设提示基本看不到，所以逐个设一遍。
+        """
+        for w in (self, self.title, self.slider, self.editor):
+            if w is not None:
+                w.setToolTip(text)
+
+    def _on_editor(self, v: int) -> None:
+        if self.slider.value() != v:
+            self.slider.blockSignals(True)
+            self.slider.setValue(int(v))
+            self.slider.blockSignals(False)
+        self.readout.setText(str(int(v)) + self._suffix)
+        self.valueChanged.emit(int(v))
 
     def _on_change(self, v: int) -> None:
         self.readout.setText(str(v) + self._suffix)
+        self._sync_editor(v)
         self.valueChanged.emit(v)
+
+    def set_range(self, lo: int, hi: int, value: int | None = None) -> None:
+        """设定范围（滑杆与输入框一起）并可选设初值。不主动发信号。"""
+        lo, hi = int(lo), max(int(lo), int(hi))
+        self.slider.blockSignals(True)
+        self.slider.setRange(lo, hi)
+        if value is not None:
+            self.slider.setValue(int(max(lo, min(int(value), hi))))
+        self.slider.blockSignals(False)
+        if self.editor is not None:
+            self.editor.blockSignals(True)
+            self.editor.setRange(lo, hi)
+            self.editor.setValue(self.slider.value())
+            self.editor.blockSignals(False)
+        self.readout.setText(str(self.slider.value()) + self._suffix)
 
     def configure(self, maximum: int, value: int = 0, suffix: str = "") -> None:
         self._suffix = suffix
-        self.slider.blockSignals(True)
-        self.slider.setRange(0, max(0, maximum))
-        self.slider.setValue(max(0, min(value, max(0, maximum))))
-        self.slider.blockSignals(False)
-        self.readout.setText(str(self.slider.value()) + suffix)
+        if self.editor is not None:
+            self.editor.setSuffix(suffix)
+        self.set_range(0, max(0, maximum), max(0, min(value, max(0, maximum))))
 
     def value(self) -> int:
         return self.slider.value()
@@ -352,6 +421,23 @@ class VariableTable(QtWidgets.QTableWidget):
 _ROLE_ORDER = (ROLE_SHOT, ROLE_RECV, ROLE_TIME)
 
 
+class _AutoHideLabel(QtWidgets.QLabel):
+    """没话说时自动收起来的标签。
+
+    一直摆着的空 QLabel 会被全局样式刷上一层比面板底色更暗的背景，看着就是
+    「一个一直用不到的框」（错误区、格式说明都踩过这个坑）。这里让 setText 顺带
+    管显隐，调用方照旧只管 setText。
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setVisible(bool(text))                  # 构造时就按有没有话说定显隐
+
+    def setText(self, text: str) -> None:            # noqa: N802 （Qt 接口名）
+        super().setText(text)
+        self.setVisible(bool(text))
+
+
 class AxisOrderDialog(QtWidgets.QDialog):
     """轴序人工确认。自动猜测只作为默认值，必须由用户过目。"""
 
@@ -402,7 +488,7 @@ class AxisOrderDialog(QtWidgets.QDialog):
         self.remember.setChecked(True)
         root.addWidget(self.remember)
 
-        self.error = QtWidgets.QLabel("")
+        self.error = _AutoHideLabel("")
         self.error.setStyleSheet(f"color: {style.ERR};")
         self.error.setWordWrap(True)
         root.addWidget(self.error)
@@ -626,6 +712,7 @@ class ExportDialog(QtWidgets.QDialog):
         self._dir = str(default_dir)
         self._stem = default_stem
         self._suffixes = set(exporter.SUFFIX_OF.values())
+        self._fitted = False                        # 首次弹出时统一一次尺寸
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 14)
@@ -672,28 +759,127 @@ class ExportDialog(QtWidgets.QDialog):
         self.scale_label.setWordWrap(True)
         root.addWidget(self.scale_label)
 
-        self.note_label = QtWidgets.QLabel("")
+        # 没话说就自动收起来：SEG-Y / SU 下这条说明是空的，留着就是一个空盒子
+        self.note_label = _AutoHideLabel("")
         self.note_label.setObjectName("Hint")
         self.note_label.setWordWrap(True)
         root.addWidget(self.note_label)
 
+        # ---- 逐剖面导出（只对矩阵格式有意义）
+        # 与 SEG-Y 参数区同一个套路：勾选框 + 缩进子块，没勾就置灰。
+        self.chk_slices = QtWidgets.QCheckBox("逐剖面导出（每片一个文件，存进上面的文件夹）")
+        self.chk_slices.setToolTip(
+            "沿一个方向切开，每片写成一个独立的二维矩阵文件。\n"
+            "例如 901 个共炮点剖面 → 901 个文件。\n"
+            "勾上之后「保存到」那一栏填的是文件夹，不是文件。\n"
+            "每片的方向与剖面窗口一致：行 = 纵轴、列 = 横轴。")
+        self.chk_slices.toggled.connect(self._on_slices_toggled)
+        root.addWidget(self.chk_slices)
+
+        self.slices_body = QtWidgets.QFrame()
+        self.slices_body.setObjectName("SubPanel")
+        body = QtWidgets.QVBoxLayout(self.slices_body)
+        body.setContentsMargins(18, 0, 0, 2)
+        body.setSpacing(6)
+
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
+        self.combo_axis = WheelSafeComboBox()
+        for title, key in exporter.SLICE_AXES:
+            self.combo_axis.addItem(title, key)
+        self.combo_axis.currentIndexChanged.connect(lambda _i: self._refresh_slice_texts())
+        self.edit_name = QtWidgets.QLineEdit(self._stem)     # 先填一个具体名字，用户可改
+        self.edit_name.setPlaceholderText("可留空，留空就是 0 / 1 / 2 …")
+        self.edit_name.setToolTip(
+            "生成的文件名 = 文件名 + 下划线 + 序号 + 目标格式，例如 demo_7.mat。\n"
+            "序号就是该方向的炮号 / 道号 / 时间采样号。\n"
+            "留空则直接用序号做文件名，例如 7.mat。")
+        self.edit_name.textChanged.connect(lambda _t: self._refresh_slice_texts())
+        for i, (label, w) in enumerate([("剖面方向", self.combo_axis),
+                                       ("文件名", self.edit_name)]):
+            lb = QtWidgets.QLabel(label)
+            lb.setObjectName("Hint")
+            grid.addWidget(lb, i, 0)
+            grid.addWidget(w, i, 1)
+        body.addLayout(grid)
+
+        # 一句话把规则说清楚 + 一个具体例子。两行都是短句，不随状态换行数，
+        # 所以勾选前后对话框高度一动不动。
+        self.slice_rule = QtWidgets.QLabel("")
+        self.slice_rule.setObjectName("Hint")
+        self.slice_rule.setWordWrap(True)
+        body.addWidget(self.slice_rule)
+
+        self.slice_preview = QtWidgets.QLabel("")
+        self.slice_preview.setObjectName("Hint")
+        self.slice_preview.setWordWrap(True)
+        body.addWidget(self.slice_preview)
+        root.addWidget(self.slices_body)
+
         # ---- SEG-Y / SU 专用参数
+        # 排版按"哪些是必填、哪些勾了才要填"分成两层：
+        #   ① 采样间隔 —— 任何情况下都要写，单独一行，标注"必填"
+        #   ② 规则坐标 —— 勾选才需要填下面两个间距，所以两个间距缩进放在复选框下面
+        # 这样不用读文字说明也能看出依赖关系。
         self.seis_box = QtWidgets.QFrame()
         self.seis_box.setObjectName("Panel")
         sbox = QtWidgets.QVBoxLayout(self.seis_box)
         sbox.setContentsMargins(12, 10, 12, 10)
         sbox.setSpacing(7)
-        sbox.addWidget(SectionLabel("道头参数（合成）"))
+        sbox.addWidget(SectionLabel("道头参数"))
 
-        grid = QtWidgets.QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(6)
         dt_us = int(round(volume.dt * 1e6)) or 1000
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        lab_dt = QtWidgets.QLabel("采样间隔（必填）")
+        lab_dt.setObjectName("Hint")
         self.spin_dt_us = WheelSafeSpinBox()
         self.spin_dt_us.setRange(1, 65535)
         self.spin_dt_us.setValue(min(65535, max(1, dt_us)))
         self.spin_dt_us.setSuffix(" µs")
-        self.spin_dt_us.setMinimumWidth(110)
+        self.spin_dt_us.setMinimumWidth(120)
+        self.spin_dt_us.setToolTip(
+            "写入文件头（Interval）与每道道头（TRACE_SAMPLE_INTERVAL）。\n"
+            "每道采样数、道数自动取自当前数据，不用填。")
+        row.addWidget(lab_dt)
+        row.addWidget(self.spin_dt_us, 1)
+        sbox.addLayout(row)
+
+        need = QtWidgets.QLabel(
+            f"每道 {volume.nt} 个采样、共 {volume.ns * volume.nr} 道 —— 这两项自动取自数据。")
+        need.setObjectName("Hint")
+        need.setWordWrap(True)
+        sbox.addWidget(need)
+
+        sline = QtWidgets.QFrame()
+        sline.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        sline.setStyleSheet(f"color: {style.LINE}; background: {style.LINE}; max-height: 1px;")
+        sbox.addWidget(sline)
+
+        self.chk_coords = QtWidgets.QCheckBox("写入坐标道头（按间距推算，非实测坐标，可选）")
+        self.chk_coords.setChecked(True)
+        self.chk_coords.setToolTip(
+            "勾选后按下面两个间距推算一套「规则」几何写进道头：\n"
+            "SourceX = 炮号 × ds\n"
+            "GroupX  = SourceX + 道号 × dx\n"
+            "offset  = 道号 × dx\n"
+            "等价于「排列随炮整体移动」的滑动排列，三者自洽（offset == GroupX − SourceX）。\n"
+            "dx 带小数时会写入坐标标量，避免小数被取整。\n\n"
+            "暂不支持每炮观测系统排列不同的情况。")
+        self.chk_coords.toggled.connect(self._sync_coords_enabled)
+        sbox.addWidget(self.chk_coords)
+
+        self.coords_body = QtWidgets.QFrame()
+        self.coords_body.setObjectName("SubPanel")
+        body = QtWidgets.QVBoxLayout(self.coords_body)
+        body.setContentsMargins(18, 0, 0, 2)
+        body.setSpacing(6)
+
+        grid = QtWidgets.QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(6)
         self.spin_dx = WheelSafeDoubleSpinBox()
         self.spin_dx.setRange(0.0, 1e6)
         self.spin_dx.setDecimals(3)
@@ -706,39 +892,30 @@ class ExportDialog(QtWidgets.QDialog):
         self.spin_ds.setValue(float(volume.ds))
         self.spin_ds.setSuffix(" m")
         self.spin_ds.setMinimumWidth(110)
-        for i, (name, w, tip) in enumerate([
-                ("采样间隔", self.spin_dt_us, "写入二进制头与每道道头（TRACE_SAMPLE_INTERVAL）"),
-                ("检波器间距 dx", self.spin_dx, "只在勾选下面「写入空间坐标」时使用"),
-                ("炮点间距 ds", self.spin_ds, "只在勾选下面「写入空间坐标」时使用")]):
+        for i, (name, w) in enumerate([("检波器间距 dx", self.spin_dx),
+                                       ("炮点间距 ds", self.spin_ds)]):
             lb = QtWidgets.QLabel(name)
             lb.setObjectName("Hint")
-            lb.setToolTip(tip)
-            w.setToolTip(tip)
+            w.setToolTip("按下式推算坐标：SourceX = 炮号 × ds，"
+                         "GroupX = SourceX + 道号 × dx，offset = 道号 × dx")
             grid.addWidget(lb, i, 0)
             grid.addWidget(w, i, 1)
-        sbox.addLayout(grid)
+        body.addLayout(grid)
 
-        self.chk_coords = QtWidgets.QCheckBox("写入空间坐标（SourceX / GroupX / offset）")
-        self.chk_coords.setChecked(True)
-        self.chk_coords.setToolTip(
-            "勾选后按规则合成几何：\n"
-            "SourceX = 炮号 × ds\n"
-            "GroupX  = 炮号 × ds + 道号 × dx\n"
-            "offset  = 道号 × dx\n"
-            "三者自洽（offset == GroupX − SourceX）。\n"
-            "dx 带小数时会写入坐标标量（SourceGroupScalar），避免小数被取整。")
-        sbox.addWidget(self.chk_coords)
+        rule = QtWidgets.QLabel("SourceX = 炮号×ds　GroupX = SourceX + 道号×dx　offset = 道号×dx")
+        rule.setObjectName("Hint")
+        rule.setWordWrap(True)
+        body.addWidget(rule)
+        sbox.addWidget(self.coords_body)
 
-        self.seis_note = QtWidgets.QLabel(
-            "道头按规则合成：FieldRecord = 炮号 + 1、TraceNumber = 道号 + 1、\n"
-            "TRACE_SAMPLE_COUNT、TRACE_SAMPLE_INTERVAL；采样格式写 IEEE float32（格式码 5）。\n"
-            "源文件原有的其它道头字段（CDP、高程、日期等）不会被带过来。")
+        self.seis_note = QtWidgets.QLabel("除此之外不继承源文件道头。")
         self.seis_note.setObjectName("Hint")
         self.seis_note.setWordWrap(True)
         sbox.addWidget(self.seis_note)
         root.addWidget(self.seis_box)
+        self._sync_coords_enabled()
 
-        self.error = QtWidgets.QLabel("")
+        self.error = _AutoHideLabel("")
         self.error.setStyleSheet(f"color: {style.ERR};")
         self.error.setWordWrap(True)
         root.addWidget(self.error)
@@ -775,33 +952,153 @@ class ExportDialog(QtWidgets.QDialog):
     def with_coords(self) -> bool:
         return self.chk_coords.isChecked()
 
+    def per_slice(self) -> bool:
+        """是否逐剖面导出。用格式判定而不是 isVisible()：弹出前也要答对。"""
+        return self.fmt() in exporter.MATRIX_KEYS and self.chk_slices.isChecked()
+
+    def slice_axis(self) -> str:
+        return self.combo_axis.currentData() or "shot"
+
+    def name_prefix(self) -> str:
+        """单片文件名的前缀（可留空，留空就是纯序号）。"""
+        return self.edit_name.text().strip()
+
+    def _sync_coords_enabled(self) -> None:
+        """勾了「写入坐标道头」才需要填下面两个间距 —— 没勾就把它们置灰。
+
+        用置灰而不是隐藏：对话框高度不会跳，而且能看出"这里有两个参数，
+        勾上就能填"。（:disabled 的样式在 style.py 里，现在看得出来了。）
+        """
+        self.coords_body.setEnabled(self.chk_coords.isChecked())
+
+    def _sync_slices_enabled(self) -> None:
+        self.slices_body.setEnabled(self.chk_slices.isChecked())
+
     # ---------------------------------------------------------------- 交互
+    def _on_slices_toggled(self, _checked: bool = False) -> None:
+        self._sync_slices_enabled()
+        self._refresh_path()
+        self._refresh_slice_texts()
+
     def _on_format(self) -> None:
         fmt = self.fmt()
         seis = fmt in exporter.SEISMIC_KEYS
+        matrix = fmt in exporter.MATRIX_KEYS
         self.seis_box.setVisible(seis)
 
-        cur = self.path()
-        p = Path(cur) if cur else None
-        if p is None or p.suffix.lower() not in self._suffixes:
-            p = Path(self._dir) / (self._stem + exporter.SUFFIX_OF[fmt])
-        else:
-            p = p.with_suffix(exporter.SUFFIX_OF[fmt])
-        self.path_edit.setText(str(p))
+        # 逐剖面只对矩阵格式有意义：切到 SEG-Y / SU 时，连勾选框和下面那一整块
+        # 都收起来，别留下一堆用不上的东西
+        self.chk_slices.setVisible(matrix)
+        self.slices_body.setVisible(matrix)
+        if not matrix and self.chk_slices.isChecked():
+            self.chk_slices.setChecked(False)
+        self._sync_slices_enabled()
 
-        self.scale_label.setText(exporter.describe(self._vol.data, fmt))
+        self._refresh_path()
+        self._refresh_scale_label()
         if seis:
-            self.note_label.setText(
-                "SEG-Y / SU 是「逐道带道头」的格式，立方体是个抽象网格，\n"
-                "所以这里会合成一套最小但正确的道头，保证任何软件都能正确定位与分选。")
+            self.note_label.setText("")
         else:
             self.note_label.setText(
-                "⚠ 只导出数据矩阵：不含 dt / dx / ds 等元信息（标尺会丢），\n"
-                "缺道位置以 0 填充，因此下游无法区分「真 0」与「缺道」。\n"
-                "数据形状 S × R × T = 炮 × 检波器 × 时间，未做任何显示相关的处理。")
+                "⚠ 只导出数据矩阵（形状 = 炮 × 检波器 × 时间）：\n"
+                "不含 dt / dx / ds 等元信息（标尺会丢）；缺道以 0 填充。")
         self.error.setText("")
+        self._refresh_slice_texts()
+        self._refit_height()
+
+    def _refresh_path(self) -> None:
+        """路径栏的语义随模式变：整卷导出填**文件**，逐剖面导出填**文件夹**。
+
+        标签文字**不跟着变** —— 「保存到」和「保存到文件夹」宽度不同，一改就会把
+        右边的输入框挤得左右跳。文件夹这件事写在勾选框文字和提示里。
+        """
+        cur = self.path()
+        if self.per_slice():
+            p = Path(cur) if cur else Path(self._dir)
+            if p.suffix.lower() in self._suffixes:      # 原来是文件 → 退到它所在的目录
+                p = p.parent
+            self.path_edit.setText(str(p))
+        else:
+            suffix = exporter.SUFFIX_OF[self.fmt()]
+            p = Path(cur) if cur else None
+            if p is not None and p.suffix.lower() in self._suffixes:
+                p = p.with_suffix(suffix)
+            else:
+                # 当前是个目录（刚在逐剖面模式下）→ 在它里面放默认文件名
+                base = p if (p is not None and str(p)) else Path(self._dir)
+                p = base / (self._stem + suffix)
+            self.path_edit.setText(str(p))
+
+    def _refresh_scale_label(self) -> None:
+        """规模说明：整卷导出报整卷，逐剖面报「多少片、每片多大」。"""
+        if self.per_slice():
+            self.scale_label.setText(
+                exporter.describe_slices(self._vol.data, self.slice_axis(), self.fmt()))
+        else:
+            self.scale_label.setText(exporter.describe(self._vol.data, self.fmt()))
+
+    def _refresh_slice_texts(self) -> None:
+        """规则一句 + 例子一行，**两行永远都有内容**。
+
+        不按勾选状态清空：空标签会被全局样式刷成一个暗色小方块（空盒子），
+        而「勾上才出现一行」又会让对话框高度在勾选时跳一下 —— 两头都不讨好。
+        子块没勾时整体是置灰的，看例子也清楚「这是勾上以后的效果」。
+        """
+        self._refresh_scale_label()
+        axis = self.slice_axis()
+        word = exporter.SLICE_INDEX_WORD.get(axis, "序号")
+        suffix = exporter.SUFFIX_OF[self.fmt()]
+        self.slice_rule.setText(
+            f"规则：文件名 + 下划线 + {word} + {suffix}；文件名留空就只用{word}。")
+        try:
+            exporter.check_name(self.name_prefix())
+        except exporter.ExportError as exc:
+            self.slice_preview.setText(f"⚠ {exc}")
+            self._refit_height()
+            return
+        total = exporter.slice_count(self._vol.data, axis)
+        names = [exporter.slice_name(self.name_prefix(), i, suffix)
+                 for i in range(min(2, total))]
+        more = "…" if total > len(names) else ""
+        self.slice_preview.setText(f"例：{'、'.join(names)}{more}　共 {total} 个文件")
+        self._refit_height()
+
+    def _refit_height(self) -> None:
+        """按当前宽度重算高度，把多出来的留白收回去。
+
+        顶层窗口只在布局**要求变大**时才会跟着长（所以切到 SEG-Y / SU 会自己长高），
+        反过来缩小它不管 —— 切回矩阵格式后底部就留一大片空白。宽度保持用户拖出来的值。
+        构造期（还没显示）不调：那时窗口还没有真实尺寸，硬 resize 会把
+        首次弹出的大小钉死在 640×480 这种默认值上，让 Qt 自己按 sizeHint 定更合适。
+        """
+        if not self.isVisible() or self.layout() is None:
+            return
+        lay = self.layout()
+        lay.activate()
+        w = self.width()
+        h = lay.heightForWidth(w)
+        if h <= 0:                                  # 极端情况下退回 sizeHint
+            h = self.sizeHint().height()
+        self.resize(w, max(h, self.minimumSizeHint().height()))
+
+    def showEvent(self, ev) -> None:                # noqa: N802 （Qt 接口名）
+        """弹出时先按「重算高度」的算法定一次尺寸。
+
+        Qt 首次显示用的是 sizeHint，跟 heightForWidth 差十几个像素；不先统一，
+        用户第一次动某个选项时窗口会突然跳一下。
+        """
+        super().showEvent(ev)
+        if not self._fitted:
+            self._fitted = True
+            self._refit_height()
 
     def _browse(self) -> None:
+        if self.per_slice():                    # 逐剖面导出选的是文件夹
+            folder = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "选择导出文件夹", self.path())
+            if folder:
+                self.path_edit.setText(folder)
+            return
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "导出到", self.path(),
             f"{self.combo_fmt.currentText()} (*{exporter.SUFFIX_OF[self.fmt()]});;所有文件 (*)")
@@ -810,23 +1107,89 @@ class ExportDialog(QtWidgets.QDialog):
                 path += exporter.SUFFIX_OF[self.fmt()]
             self.path_edit.setText(path)
 
+    def _fail(self, message: str) -> None:
+        """报错：显示文字并让对话框把这段高度撑开（不然红字会被挤掉）。"""
+        self.error.setText(message)
+        self._refit_height()
+
+    def summary(self) -> str:
+        """把「这次导出到底要干什么」汇总成几行，给确认框用。"""
+        vol, fmt = self._vol, self.fmt()
+        lines = [f"格式：{exporter.LABEL_OF.get(fmt, fmt)}"]
+        if self.per_slice():
+            axis = self.slice_axis()
+            total = exporter.slice_count(vol.data, axis)
+            rows, cols = exporter.slice_shape(vol.data, axis)
+            lines.append(f"内容：逐剖面导出 {total} 个文件"
+                         f"（沿「{exporter.SLICE_LABEL_OF.get(axis, axis)}」，"
+                         f"每片 {rows} × {cols}）")
+            lines.append(f"文件夹：{self.path()}")
+            heads = [exporter.slice_name(self.name_prefix(), i, exporter.SUFFIX_OF[fmt])
+                     for i in range(min(2, total))]
+            lines.append("文件名：" + "、".join(heads) + ("…" if total > len(heads) else ""))
+        else:
+            n_shot, n_r, n_t = (int(v) for v in vol.shape)
+            size = exporter.size_text(int(vol.data.size) * 4)
+            lines.append(f"内容：整卷数据 {n_shot} 炮 × {n_r} 道 × {n_t} 采样（约 {size}）")
+            lines.append(f"保存到：{self.path()}")
+            if fmt in exporter.SEISMIC_KEYS:
+                lines.append(f"采样间隔：{self.dt_us()} µs")
+                coords = ("附带规则坐标（道距 "
+                          f"{self.dx():g} m、炮距 {self.ds():g} m）" if self.with_coords()
+                          else "不带坐标")
+                lines.append(f"道头：写炮号 / 道号 / 采样参数；{coords}")
+        return "\n".join(lines)
+
+    def _confirm(self) -> bool:
+        """导出前的最后确认：把动作信息摆出来，顺带把「要不要覆盖」一起问掉。
+
+        覆盖原本是单独一个弹窗，两个框连着弹更容易点错，所以并成一次。
+        """
+        exists = (not self.per_slice()) and Path(self.path()).exists()
+        body = self.summary()
+        if self.per_slice():
+            body += "\n\n目标文件夹里的同名文件会被覆盖。"
+        elif exists:
+            body += f"\n\n⚠ {Path(self.path()).name} 已存在，会被覆盖。"
+        box = QtWidgets.QMessageBox(self)
+        box.setWindowTitle("确认导出")
+        box.setIcon(QtWidgets.QMessageBox.Icon.Question)
+        box.setText(body)
+        ok = box.addButton("覆盖" if exists else "导出",
+                           QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        cancel = box.addButton("取消", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+        # 默认按钮 = 按回车时触发的那一个。凡是有覆盖风险的情况（目标文件已存在、
+        # 或逐剖面导出可能覆盖一整批同名文件），都默认落在「取消」上。
+        box.setDefaultButton(cancel if (exists or self.per_slice()) else ok)
+        box.exec()
+        return box.clickedButton() is ok
+
     def _validate(self) -> None:
         path = self.path()
+        if self.per_slice():
+            if not path:
+                self._fail("请先指定导出文件夹。")
+                return
+            if not Path(path).is_dir():
+                self._fail(f"文件夹不存在：{path}")
+                return
+            try:
+                exporter.check_name(self.name_prefix())
+            except exporter.ExportError as exc:
+                self._fail(str(exc))
+                return
+            if self._confirm():
+                self.accept()
+            return
         if not path:
-            self.error.setText("请先指定保存路径。")
+            self._fail("请先指定保存路径。")
             return
         p = Path(path)
         if p.parent and not p.parent.exists():
-            self.error.setText(f"目录不存在：{p.parent}")
+            self._fail(f"目录不存在：{p.parent}")
             return
-        if p.exists():
-            ans = QtWidgets.QMessageBox.question(
-                self, "覆盖确认", f"{p.name} 已存在，覆盖吗？",
-                QtWidgets.QMessageBox.StandardButton.Yes
-                | QtWidgets.QMessageBox.StandardButton.No)
-            if ans != QtWidgets.QMessageBox.StandardButton.Yes:
-                return
-        self.accept()
+        if self._confirm():
+            self.accept()
 
 
 # ==================================================================== 部件容器

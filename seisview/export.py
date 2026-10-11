@@ -41,6 +41,13 @@ offset（可选）          r·dx（取整，按惯例不乘坐标标量）
 ``.npy`` 走"先写头、再 memmap 逐炮填"，全程只有一炮在内存里；
 ``.npz`` / ``.mat`` 的写入库都需要一整块连续数组，所以先整体拷进内存一次，
 超出上限时明确拒绝并建议改用 .npy。
+
+逐剖面导出
+----------
+矩阵格式还可以**沿某一轴切开、每片写成一个独立文件**（例如 901 个共炮点剖面 →
+901 个 ``.mat``）。每片的方向与软件里的剖面窗口一致：**行 = 纵轴、列 = 横轴**。
+文件名只有一条规则：``文件名_序号`` + 扩展名，``文件名`` 留空就只用序号；
+序号就是该方向的炮号 / 道号 / 时间采样号（不补零）。
 """
 
 from __future__ import annotations
@@ -64,6 +71,22 @@ MATRIX_KEYS = ("npy", "npz", "mat")
 SEISMIC_KEYS = ("sgy", "su")
 NPZ_ARRAY_KEY = "cube"
 MAT_ARRAY_KEY = "cube"
+
+# ------------------------------------------------------------------ 逐剖面
+# 切片方向：显示名 → 轴标识。括号里写的是导出矩阵的形状（行 * 列），
+# 与软件里的剖面窗口一致，也方便一眼对上"会拿到一张什么样的二维矩阵"。
+SLICE_AXES = [
+    ("共炮点剖面（时间*偏移距）", "shot"),
+    ("共检波点剖面（时间*炮点）", "recv"),
+    ("时间切片（炮点*偏移距）", "time"),
+]
+SLICE_LABEL_OF = {key: name for name, key in SLICE_AXES}
+# 序号在文件名里代表什么（给界面写示例用）
+SLICE_INDEX_WORD = {"shot": "炮号", "recv": "道号", "time": "时间"}
+# 文件名前缀默认留空 —— 留空时文件名就是纯序号
+DEFAULT_NAME_PREFIX = ""
+# 这些字符不能出现在文件名里（Windows 会直接失败或把路径拆开）
+_BAD_NAME_CHARS = set('/\\:*?"<>|')
 
 # 需要整块进内存的格式，超过这个体积就拒绝（避免直接把机器拖死）
 _MATERIALIZE_MAX_BYTES = 2_500_000_000
@@ -218,6 +241,140 @@ def _export_npy(path: str, cube: np.ndarray,
         out.flush()
     finally:
         del out                     # 关掉映射，之后才能安全地读回校验
+
+
+# ================================================================== 逐剖面导出
+def slice_count(cube: np.ndarray, mode: str) -> int:
+    """某一方向上能切出多少片。"""
+    axis = {"shot": 0, "recv": 1, "time": 2}.get(mode)
+    if axis is None:
+        raise ExportError(f"未知的切片方向：{mode}")
+    return int(cube.shape[axis])
+
+
+def slice_shape(cube: np.ndarray, mode: str) -> tuple[int, int]:
+    """单片矩阵的形状（行, 列），不真的切出数据。"""
+    n_shot, n_r, n_t = (int(v) for v in cube.shape)
+    if mode == "shot":
+        return (n_t, n_r)          # 时间 × 检波器，即惯例的 (nt, nr) 炮集
+    if mode == "recv":
+        return (n_t, n_shot)
+    return (n_shot, n_r)
+
+
+def take_slice(cube: np.ndarray, mode: str, index: int) -> np.ndarray:
+    """取第 ``index`` 片，方向与软件里的剖面窗口**一致**（行 = 纵轴、列 = 横轴）。
+
+    共炮点 → ``(时间, 检波器)``：正好是地震惯例的 ``(nt, nr)`` 炮集；
+    共检波点 → ``(时间, 炮点)``；时间切片 → ``(炮点, 检波器)``。
+    """
+    if mode == "shot":
+        return np.ascontiguousarray(cube[index].T)
+    if mode == "recv":
+        return np.ascontiguousarray(cube[:, index, :].T)
+    if mode == "time":
+        return np.ascontiguousarray(cube[:, :, index])
+    raise ExportError(f"未知的切片方向：{mode}")
+
+
+def check_name(name: str) -> None:
+    """校验文件名前缀：允许留空，不能有路径分隔符之类会让写文件失败的字符。"""
+    bad = sorted({c for c in str(name) if c in _BAD_NAME_CHARS})
+    if bad:
+        raise ExportError("文件名里不能出现这些字符：" + " ".join(bad))
+
+
+def slice_name(name: str, index: int, suffix: str) -> str:
+    """单片文件名 = ``文件名_序号`` + 扩展名；文件名留空就只用序号。
+
+    序号取该方向的下标，也就是炮号 / 道号 / 时间采样号；不补零，
+    所以 901 片就是 ``0.mat`` … ``900.mat``。
+    """
+    stem = str(name).strip()
+    return f"{stem}_{index}{suffix}" if stem else f"{index}{suffix}"
+
+
+def _write_matrix_file(path: str, arr: np.ndarray, fmt: str) -> None:
+    """把单片矩阵落盘（单片体积有限，直接整块写）。"""
+    if fmt == "npy":
+        np.save(path, arr, allow_pickle=False)
+    elif fmt == "npz":
+        np.savez(path, **{NPZ_ARRAY_KEY: arr})
+    else:
+        import scipy.io
+        scipy.io.savemat(path, {MAT_ARRAY_KEY: arr})
+
+
+def export_slices(folder: str | os.PathLike, cube: np.ndarray, fmt: str, *,
+                  mode: str = "shot", name: str = DEFAULT_NAME_PREFIX,
+                  progress: Progress | None = None,
+                  cancel: Cancel | None = None) -> list[str]:
+    """逐剖面导出：沿选定轴切片，每片写成 ``folder`` 下一个独立文件。
+
+    ``name`` 是文件名前缀（可留空，留空时文件名就是纯序号）。
+    返回写出的路径列表。中途取消时**已经写完的文件保留**（它们都是完整可用的），
+    只删掉正在写的那一个。
+    """
+    cube = np.asarray(cube)
+    if cube.ndim != 3:
+        raise ExportError(f"只支持三维体数据，当前是 {cube.ndim} 维。")
+    if fmt not in MATRIX_KEYS:
+        raise ExportError("逐剖面导出只支持矩阵格式（.npy / .npz / .mat）。")
+    folder = str(folder)
+    if not os.path.isdir(folder):
+        raise ExportError(f"目标文件夹不存在：{folder}")
+    check_name(name)
+
+    total = slice_count(cube, mode)
+    if total <= 0:
+        raise ExportError("这个方向上没有可导出的剖面。")
+    dtype = _native_dtype(cube)
+    per_file = int(cube.size // total) * dtype.itemsize
+    if per_file > _MATERIALIZE_MAX_BYTES:
+        raise ExportError(
+            f"单片就约 {per_file / 1024 ** 3:.1f} GB，超出上限（{size_text(_MATERIALIZE_MAX_BYTES)}）。")
+    suffix = SUFFIX_OF[fmt]
+
+    made: list[str] = []
+    try:
+        for i in range(total):
+            _tick(cancel)
+            fname = slice_name(name, i, suffix)
+            path = os.path.join(folder, fname)
+            try:
+                arr = np.ascontiguousarray(take_slice(cube, mode, i), dtype=dtype)
+                _write_matrix_file(path, arr, fmt)
+            except _Cancelled:
+                _remove_quietly(path)
+                raise
+            except ExportError:
+                _remove_quietly(path)
+                raise
+            except MemoryError as exc:
+                _remove_quietly(path)
+                raise ExportError(f"内存不足（单片约 {per_file / 1024 ** 2:.0f} MB）。") from exc
+            except Exception as exc:
+                _remove_quietly(path)
+                raise ExportError(f"写「{fname}」失败：{type(exc).__name__}: {exc}") from exc
+            made.append(path)
+            if progress is not None:
+                progress((i + 1) / total, f"第 {i + 1}/{total} 片 → {fname}")
+    except _Cancelled:
+        raise ExportError(
+            f"已取消导出：已经写出 {len(made)} 个文件，都在 {folder}。") from None
+    if progress is not None:
+        progress(1.0, "完成")
+    return made
+
+
+def describe_slices(cube: np.ndarray, mode: str, fmt: str) -> str:
+    """逐剖面导出的规模说明。"""
+    total = slice_count(cube, mode)
+    rows, cols = slice_shape(cube, mode)
+    nbytes = rows * cols * 4                    # 统一按 float32 估
+    return (f"沿「{SLICE_LABEL_OF.get(mode, mode)}」共 {total} 片，"
+            f"每片 {rows} × {cols}（约 {size_text(nbytes)}）\n"
+            f"将写成 {total} 个 {SUFFIX_OF[fmt]} 文件，总共约 {size_text(nbytes * total)}")
 
 
 # ====================================================================== SEG-Y
@@ -398,8 +555,8 @@ def _write_su(path: str, cube: np.ndarray, *, dt_us: int, dx: float, ds: float,
         progress(1.0, "完成")
 
 
-def _size_text(nbytes: int) -> str:
-    """人读的体积：小文件别显示成"约 0.00 GB"。"""
+def size_text(nbytes: int) -> str:
+    """人读的体积：小文件别显示成「约 0.00 GB」。"""
     if nbytes >= 1024 ** 3:
         return f"{nbytes / 1024 ** 3:.2f} GB"
     return f"{nbytes / 1024 ** 2:.1f} MB"
@@ -408,11 +565,12 @@ def _size_text(nbytes: int) -> str:
 def describe(cube: np.ndarray, fmt: str) -> str:
     """导出前的规模说明，用于在对话框里提示大致要写多少数据。"""
     nbytes = int(cube.size) * 4          # 统一按 float32 估，避免 int32 溢出
-    size = _size_text(nbytes)
+    size = size_text(nbytes)
     text = f"{cube.shape[0]} 炮 × {cube.shape[1]} 道 × {cube.shape[2]} 采样"
+    if fmt in ("mat", "npz"):
+        # 这两个格式的写入库都要一整块连续数组，数据大到一定程度会失败
+        # （真失败时会明确拒绝并建议改用 .npy）
+        return f"{text}\n约 {size}（需要整块进内存，数据过大时可能失败）"
     if fmt == "npy":
-        return f"{text}\n约 {size}（流式写出，内存只占一炮）"
-    if fmt in ("npz", "mat"):
-        return f"{text}\n约 {size}（需要整块进内存）"
-    return (f"{text}\n共 {cube.shape[0] * cube.shape[1]} 道，float32，约 {size}"
-            "（逐道写，内存只占一炮）")
+        return f"{text}\n约 {size}"
+    return f"{text}\n共 {cube.shape[0] * cube.shape[1]} 道，float32，约 {size}"

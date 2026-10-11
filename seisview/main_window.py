@@ -32,6 +32,12 @@ SPEEDS = [("慢", 150), ("中", 70), ("快", 35), ("极快", 16)]
 # 抽稀上限：显示名 → 每边最多像素（0 表示不抽稀）
 DOWNSAMPLE = [("不抽稀", 0), ("4096", 4096), ("2048", 2048), ("1024", 1024), ("512", 512)]
 CLIM_MODES = [("自动", "auto"), ("稳健", "robust"), ("手动", "manual")]
+# AGC 滑动窗口预设：显示名 → 点数（0 = 整道归一化）。
+# 用列表而不是数字框：整道 / 十几个点到上千点，实际就那几个常用值，
+# 点一下选完比敲数字省事，也不会有"范围给了 0~1001 但不知道填多少"的问题。
+AGC_WINDOWS = [("整道", 0), ("11 点", 11), ("21 点", 21), ("51 点", 51),
+               ("101 点", 101), ("201 点", 201), ("301 点", 301),
+               ("501 点", 501), ("1001 点", 1001)]
 # 叠加波形颜色：底色随色标变化很大，单一白色在浅底（红蓝/彩虹）上几乎看不见，
 # 所以给几个可直接切换的选项，默认用地震剖面惯用的黑色。
 WIGGLE_COLORS = [
@@ -41,6 +47,14 @@ WIGGLE_COLORS = [
     ("黄", (250, 204, 21, 235)),
 ]
 AXIS_TITLES = {"shot": "炮点 S", "recv": "检波器 R", "time": "时间 T"}
+
+
+def _hdivider() -> QtWidgets.QFrame:
+    """面板里的分组横线：把"同一件事"的设置与别的设置隔开。"""
+    line = QtWidgets.QFrame()
+    line.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+    line.setStyleSheet(f"color: {style.LINE}; background: {style.LINE}; max-height: 1px;")
+    return line
 
 
 class TraceView(QtWidgets.QWidget):
@@ -95,7 +109,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trace = (0, 0)                 # (炮点, 检波器)
         self._base_clim = (-1.0, 1.0)
         self._clim = (-1.0, 1.0)
-        self._contrast = 1.0
+        self._clim_scale = 1.0              # 色标半窗宽的倍数（对比度滑块的换算结果）
         self._stats = {"min": 0.0, "max": 0.0, "mean": 0.0, "rms": 0.0}
 
         self._timer = QtCore.QTimer(self)
@@ -210,8 +224,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_sample.setToolTip(
             "载入程序内置的合成三维体（不读文件）：\n"
             "24 炮 × 72 检波点 × 700 采样，dt=0.002 s，\n"
-            "4 个倾斜反射层 + 2 个绕射点 + 噪声。\n"
-            "sample_data/ 里的 .npz/.npy/.mat 请用「打开文件」。")
+            "4 个倾斜反射层 + 2 个绕射点 + 噪声。")
         self.btn_sample.clicked.connect(self.load_sample)
 
         self.btn_export = QtWidgets.QPushButton("导出 / 转换")
@@ -219,8 +232,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_export.setMinimumWidth(104)
         self.btn_export.setEnabled(False)
         self.btn_export.setToolTip(
-            "把当前体数据导出成矩阵（.npy / .npz / .mat），\n"
-            "或按规则合成道头写成 SEG-Y / SU。　快捷键 Ctrl+E")
+            "把当前体数据写成矩阵（.npy / .npz / .mat）或 SEG-Y / SU。　快捷键 Ctrl+E")
         self.btn_export.clicked.connect(self.export_volume)
 
         row.addWidget(self.btn_open)
@@ -334,10 +346,8 @@ class MainWindow(QtWidgets.QMainWindow):
         step.setContentsMargins(0, 0, 0, 0)
         step.setSpacing(6)
         self.btn_prev = QtWidgets.QPushButton("◀  上一切片")
-        self.btn_prev.setToolTip("切换到前一个切片")
         self.btn_prev.clicked.connect(lambda: self._step(-1))
         self.btn_next = QtWidgets.QPushButton("下一切片  ▶")
-        self.btn_next.setToolTip("切换到后一个切片")
         self.btn_next.clicked.connect(lambda: self._step(1))
         step.addWidget(self.btn_prev, 1)
         step.addWidget(self.btn_next, 1)
@@ -367,6 +377,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for name, interval in SPEEDS:
             self.speed_combo.addItem(name, interval)
         self.speed_combo.setCurrentIndex(1)
+        # 播放中改速度要立刻生效：定时器起过之后间隔不会自己跟着下拉框变
+        self.speed_combo.currentIndexChanged.connect(self._on_speed)
         self.chk_loop = QtWidgets.QCheckBox("循环")
         self.chk_loop.setChecked(True)
         row2.addWidget(lab)
@@ -395,6 +407,7 @@ class MainWindow(QtWidgets.QMainWindow):
         r2.setSpacing(8)
         lab2 = QtWidgets.QLabel("色标上限")
         lab2.setObjectName("Hint")
+        self.lab_clim = lab2                        # 跟着上面的下拉一起置灰
         self.clim_combo = WheelSafeComboBox()
         for name, key in CLIM_MODES:
             self.clim_combo.addItem(name, key)
@@ -407,46 +420,47 @@ class MainWindow(QtWidgets.QMainWindow):
         r2.addWidget(self.spin_manual)
         lay.addLayout(r2)
 
-        self.contrast = SliderRow("对比度")
-        self.contrast.slider.setRange(20, 400)
-        self.contrast.slider.setValue(100)
+        self.contrast = SliderRow("对比度", spin=True, suffix=" %")
+        self.contrast.set_range(20, 400, 100)
+        self.contrast.set_tooltip(
+            "对比度倍数：100% 就是基准色标窗口。\n"
+            "数值越大 → 窗口越窄 → 被压成纯色（红/蓝）的样点越多、画面越「硬」；\n"
+            "200% ≈ 窗口减半（对比度翻倍），50% ≈ 窗口加倍（画面变柔和）。")
         self.contrast.valueChanged.connect(self._on_contrast)
         lay.addWidget(self.contrast)
 
-        line = QtWidgets.QFrame()
-        line.setFrameShape(QtWidgets.QFrame.Shape.HLine)
-        line.setStyleSheet(f"color: {style.LINE}; background: {style.LINE}; max-height: 1px;")
-        lay.addWidget(line)
+        # ---------------- 增益：AGC 及其窗口
+        lay.addWidget(_hdivider())
 
         self.chk_agc = QtWidgets.QCheckBox("自动增益 AGC（按道归一化）")
-        self.chk_agc.setToolTip("按道做滑动窗口 RMS 归一化，把深浅部的能量拉到同一量级")
-        self.chk_agc.toggled.connect(lambda _v: self._refresh_all())
-        self.chk_agc.toggled.connect(self._sync_display_enabled)
+        self.chk_agc.setToolTip(
+            "按道做滑动窗口 RMS 归一化，把深浅部的能量拉到同一量级。\n"
+            "开启后色标由 AGC 接管（「色标上限」会置灰）；对比度仍可微调。")
+        self.chk_agc.toggled.connect(self._on_gate_toggle)
         lay.addWidget(self.chk_agc)
         row = QtWidgets.QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
         lab3 = QtWidgets.QLabel("AGC 窗口")
         lab3.setObjectName("Hint")
-        self.spin_agc = WheelSafeSpinBox()
-        self.spin_agc.setRange(0, 1001)
-        self.spin_agc.setValue(0)
-        self.spin_agc.setSpecialValueText("整道")
-        self.spin_agc.setSingleStep(20)     # 默认步长 1 要点上百下，直接给 20
-        self.spin_agc.setSuffix(" 点")
-        self.spin_agc.setToolTip(
-            "滑动窗口的点数，直接键入即可（奇数点，偶数会自动 +1）。\n"
-            "0 = 整道归一化。常用 21 / 51 / 101 / 201 点。")
-        self.spin_agc.valueChanged.connect(lambda _v: self._refresh_all())
+        self.lab_agc = lab3
+        self.combo_agc = WheelSafeComboBox()
+        for name, points in AGC_WINDOWS:
+            self.combo_agc.addItem(name, points)
+        self.combo_agc.setToolTip(
+            "滑动窗口的点数：整道 = 整条道一起归一化。\n"
+            "点数越小，深浅部拉得越平，横向对比也越弱。不知道选哪个就先试 101 点。")
+        self.combo_agc.currentIndexChanged.connect(lambda _i: self._refresh_all())
         row.addWidget(lab3)
-        row.addWidget(self.spin_agc, 1)
+        row.addWidget(self.combo_agc, 1)
         lay.addLayout(row)
-        self._agc_widgets = [lab3, self.spin_agc]
+
+        # ---------------- 波形叠加：三个参数都只对叠加曲线起作用
+        lay.addWidget(_hdivider())
 
         self.chk_wiggle = QtWidgets.QCheckBox("叠加波形（wiggle）")
         self.chk_wiggle.setToolTip("在剖面上叠加波形曲线，看同相轴的形状与极性")
-        self.chk_wiggle.toggled.connect(lambda _v: self._refresh_all())
-        self.chk_wiggle.toggled.connect(self._sync_display_enabled)
+        self.chk_wiggle.toggled.connect(self._on_gate_toggle)
         lay.addWidget(self.chk_wiggle)
 
         row = QtWidgets.QHBoxLayout()
@@ -454,14 +468,20 @@ class MainWindow(QtWidgets.QMainWindow):
         row.setSpacing(8)
         lab5 = QtWidgets.QLabel("波形道数")
         lab5.setObjectName("Hint")
+        self.lab_wig = lab5
         self.spin_wig = WheelSafeSpinBox()
         self.spin_wig.setRange(1, 300)
         self.spin_wig.setValue(60)
+        self.spin_wig.setKeyboardTracking(False)   # 回车/失焦才提交，免得边敲边重绘
+        self.spin_wig.setToolTip(
+            "在剖面宽度内「等间隔抽取」这么多道画波形曲线。\n"
+            "注意是「最多画多少条」，不是「每几道画一条」。")
         self.spin_wig.valueChanged.connect(lambda _v: self._refresh_all())
         row.addWidget(lab5)
         row.addWidget(self.spin_wig, 1)
         lab5b = QtWidgets.QLabel("颜色")
         lab5b.setObjectName("Hint")
+        self.lab_wig_color = lab5b
         self.combo_wig_color = WheelSafeComboBox()
         for name, rgba in WIGGLE_COLORS:
             self.combo_wig_color.addItem(name, rgba)
@@ -473,12 +493,14 @@ class MainWindow(QtWidgets.QMainWindow):
         row.addWidget(self.combo_wig_color)
         lay.addLayout(row)
 
-        self.gain = SliderRow("波形幅度")
-        self.gain.slider.setRange(10, 250)
-        self.gain.slider.setValue(100)
+        self.gain = SliderRow("波形幅度", spin=True, suffix=" %")
+        self.gain.set_range(10, 250, 100)
+        self.gain.set_tooltip("叠加波形的横向摆幅，100% 时一条曲线最宽到道间距的九成")
         self.gain.valueChanged.connect(lambda _v: self._refresh_all())
         lay.addWidget(self.gain)
-        self._wig_widgets = [lab5, self.spin_wig, lab5b, self.combo_wig_color, self.gain]
+
+        # ---------------- 性能：与「画成什么样」无关，只影响开销
+        lay.addWidget(_hdivider())
 
         row = QtWidgets.QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
@@ -489,24 +511,45 @@ class MainWindow(QtWidgets.QMainWindow):
         for name, limit in DOWNSAMPLE:
             self.combo_dec.addItem(name, limit)
         self.combo_dec.setCurrentIndex(2)
-        self.combo_dec.setToolTip("上色前先把剖面按整数步长抽稀到不超过这个像素数")
+        self.combo_dec.setToolTip("显示时剖面最多用这么多像素绘制（调小更流畅，细节会少一些）")
         self.combo_dec.currentIndexChanged.connect(lambda _i: self._refresh_all())
         row.addWidget(lab4)
         row.addWidget(self.combo_dec, 1)
         lay.addLayout(row)
-        self._sync_display_enabled()
+        self._sync_gated_controls()
         return card
 
-    def _sync_display_enabled(self) -> None:
-        """只让"当前真正生效"的参数可编辑。
+    def _sync_gated_controls(self) -> None:
+        """把「当前设置下不参与计算」的控件置灰，让依赖关系看得见。
 
-        AGC 没勾时改窗口、wiggle 没勾时改道数，都是白改 —— 灰掉比让人以为
-        改错了更清楚。
+        置灰而不是隐藏：面板高度不跳，而且能看出这里本来有可调项。
+        三处依赖：
+          - AGC 窗口：不勾 AGC 时这个窗口点数根本用不上
+          - 色标上限（自动/稳健/手动）：AGC 一开，基准窗口就固定成逐片重算的稳健口径
+          - 波形道数 / 颜色 / 幅度：不叠波形时它们不起任何作用
+
+        这里**只改颜色、绝不改几何**：以前 AGC 下面挂过一行随时显隐的说明文字，
+        一开关就整块重排（卡片高 408↔461，滚动内容 1217↔1270），看上去就是面板
+        「抖一下」。说明改挂到 AGC 复选框的 tooltip 上了。
         """
-        for w in getattr(self, "_agc_widgets", []):
-            w.setEnabled(self.chk_agc.isChecked())
-        for w in getattr(self, "_wig_widgets", []):
-            w.setEnabled(self.chk_wiggle.isChecked())
+        agc_on = self.chk_agc.isChecked()
+        self.lab_agc.setEnabled(agc_on)
+        self.combo_agc.setEnabled(agc_on)
+        self.lab_clim.setEnabled(not agc_on)
+        self.clim_combo.setEnabled(not agc_on)
+        self.spin_manual.setEnabled(not agc_on and self.clim_combo.currentData() == "manual")
+
+        wig_on = self.chk_wiggle.isChecked()
+        self.lab_wig.setEnabled(wig_on)
+        self.lab_wig_color.setEnabled(wig_on)
+        self.spin_wig.setEnabled(wig_on)
+        self.combo_wig_color.setEnabled(wig_on)
+        self.gain.setEnabled(wig_on)        # SliderRow 会把标题一起灰掉
+
+    def _on_gate_toggle(self, _checked: bool = False) -> None:
+        """AGC / 叠加波形 开关：先同步置灰状态，再重画。"""
+        self._sync_gated_controls()
+        self._refresh_all()
 
     # -------------------------------------------------------------- 中间
     def _build_center(self) -> QtWidgets.QSplitter:
@@ -844,11 +887,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._stop()
         try:
-            out = exporter.export(path, vol.data, fmt,
-                                  dt_us=dlg.dt_us(), dx=dlg.dx(), ds=dlg.ds(),
-                                  with_coords=dlg.with_coords(),
-                                  progress=on_progress,
-                                  cancel=prog.wasCanceled)
+            if dlg.per_slice():
+                made = exporter.export_slices(
+                    path, vol.data, fmt,
+                    mode=dlg.slice_axis(), name=dlg.name_prefix(),
+                    progress=on_progress, cancel=prog.wasCanceled)
+            else:
+                out = exporter.export(path, vol.data, fmt,
+                                      dt_us=dlg.dt_us(), dx=dlg.dx(), ds=dlg.ds(),
+                                      with_coords=dlg.with_coords(),
+                                      progress=on_progress,
+                                      cancel=prog.wasCanceled)
         except exporter.ExportError as exc:
             prog.close()
             self._error("导出失败", str(exc))
@@ -859,6 +908,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         prog.setValue(100)
         prog.close()
+        if dlg.per_slice():
+            self.status.setText(
+                f"已逐剖面导出 {len(made)} 个 {exporter.LABEL_OF.get(fmt, fmt)} 文件 → {path}")
+            return
         size = Path(out).stat().st_size
         self.status.setText(
             f"已导出 {exporter.LABEL_OF.get(fmt, fmt)} → {out}"
@@ -880,6 +933,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mode_ctl.set_enabled_keys({"shot", "recv", "time"})
         self.mode_ctl.set_value(self.mode)
         self.btn_export.setEnabled(True)
+        self._sync_gated_controls()
 
         self._recompute_base_clim()
         if self.view3d is not None:
@@ -907,10 +961,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self._base_clim = compute_clim(sample, self.clim_combo.currentData(),
                                       self.spin_manual.value())
 
-    def _scaled_clim(self) -> tuple[float, float]:
-        lo, hi = self._base_clim
+    def _scaled_clim(self, base: tuple[float, float] | None = None) -> tuple[float, float]:
+        """把基准窗口按对比度缩放。
+
+        ``base`` 省略时用缓存的自动基准；AGC 开启时基准是逐切片重算的，
+        由调用方传进来。两种情况下对比度都照常生效 —— 它只是围绕窗口中点
+        对称地收紧或放宽，与基准怎么来的无关。
+        """
+        lo, hi = self._base_clim if base is None else base
         mid = 0.5 * (lo + hi)
-        half = max(1e-12, 0.5 * (hi - lo) * self._contrast)
+        half = max(1e-12, 0.5 * (hi - lo) * self._clim_scale)
         return (mid - half, mid + half)
 
     # ================================================================== 刷新
@@ -936,8 +996,10 @@ class MainWindow(QtWidgets.QMainWindow):
         img = decimate(img_full, max_cols=limit, max_rows=limit)
 
         if self.chk_agc.isChecked():
-            img = agc(img, self.spin_agc.value())
-            clim = compute_clim(img, "robust")
+            img = agc(img, int(self.combo_agc.currentData() or 0))
+            # AGC 把振幅按道归一化了，基准窗口固定用稳健口径（2%/98%）逐片重算；
+            # 对比度仍在这之上缩放，所以滑块不会因为开了 AGC 就失效。
+            clim = self._scaled_clim(compute_clim(img, "robust"))
         else:
             clim = self._scaled_clim()
         self._clim = clim
@@ -983,7 +1045,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _refresh_faces(self) -> None:
         if self.view3d is None or self.vol is None:
             return
-        agc_window = self.spin_agc.value() if self.chk_agc.isChecked() else None
+        agc_window = (int(self.combo_agc.currentData() or 0)
+                      if self.chk_agc.isChecked() else None)
         self.view3d.update_faces(self.pos["shot"], self.pos["recv"], self.pos["time"],
                                  self.cmap_combo.cmap(), self._clim,
                                  agc_window=agc_window)
@@ -1018,8 +1081,10 @@ class MainWindow(QtWidgets.QMainWindow):
             f"{SLICE_LABELS[mode]} {self.pos[mode]}/{vol.slice_index_range(mode) - 1}"
             f"　|　S={s}  R={r}  T={t * vol.dt:.3f} s"
             f"　|　时间 {vol.nt * vol.dt:.2f} s　空间 {vol.nr * vol.dx:.0f} m")
+        # 三个读数都按固定宽度右对齐：等宽字体下这样每帧占的位置一样，
+# 数值长度变化不会让状态栏里的文字左右挪动（AGC 一开这几个数就全变了）。
         self.stats_label.setText(
-            f"min {info['min']:+.3g}   max {info['max']:+.3g}   rms {info['rms']:.3g}")
+            f"min {info['min']:>+8.3g}   max {info['max']:>+8.3g}   rms {info['rms']:>+8.3g}")
 
     def _update_face_info(self) -> None:
         vol = self.vol
@@ -1092,13 +1157,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_all()
 
     def _on_clim_mode(self) -> None:
-        self.spin_manual.setEnabled(self.clim_combo.currentData() == "manual")
+        self._sync_gated_controls()
         if self.vol is not None:
             self._recompute_base_clim()
             self._refresh_all()
 
     def _on_contrast(self, value: int) -> None:
-        self._contrast = value / 100.0
+        # 方向：数值越大 → 半窗宽越小 → 裁掉的样点越多、画面越「硬」。
+        # 也就是 200% 表示窗口减半、对比度翻倍，和滑块名字一致。
+        self._clim_scale = 100.0 / max(1, int(value))
         if self.vol is not None:
             self._refresh_all(sync_controls=False)
 
@@ -1151,6 +1218,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _stop(self) -> None:
         self._timer.stop()
         self.btn_play.setText("▶  播放")
+
+    def _on_speed(self) -> None:
+        """播放中改速度立刻生效。
+
+        定时器只有在 start() 那一刻取一次间隔，之后下拉框怎么变它都不管 ——
+        所以播放中改挡位原先毫无反应，得手动把新间隔塞回去。
+        没在播放时不用动：下次 start 会读新值。
+        """
+        if self._timer.isActive():
+            self._timer.setInterval(int(self.speed_combo.currentData()))
 
     def _tick(self) -> None:
         vol = self.vol

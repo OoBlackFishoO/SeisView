@@ -18,6 +18,7 @@ ERR = "#F87171"
 TEXT = "#E6EDF7"      # 主文字
 TEXT_DIM = "#8A94A6"  # 次文字
 TEXT_MUTE = "#5A6474" # 弱文字
+TEXT_OFF = "#3B4453"  # 禁用文字（比弱文字还要暗，一眼能分辨"没生效"）
 GL_BG = "#0B0E14"
 GL_BOX = "#3D4A63"
 
@@ -179,6 +180,23 @@ QLineEdit:hover {{ border-color: {LINE_HI}; }}
 QLineEdit:focus {{ border-color: {ACCENT}; }}
 QLineEdit:read-only {{ color: {TEXT_DIM}; }}
 
+/* ------------------------------------------------------------ 禁用态外观 */
+/* 控件被禁用时必须一眼看出来。之前这几个控件的 QSS 没写 :disabled 规则，
+   灰掉之后和正常状态几乎一样，结果被当成"坏了、改不动值"。 */
+QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled,
+QLineEdit:disabled, QCheckBox:disabled {{
+    color: {TEXT_MUTE};
+    background-color: {BG};
+    border-color: {LINE};
+}}
+/* 标签的禁用态要单独写：QSS 里 id 选择器（QLabel#Hint）优先级高于伪类，
+   不然 QLabel:disabled 会被 QLabel#Hint 盖掉，置灰看不出来。 */
+QLabel:disabled, QLabel#Hint:disabled, QLabel#Value:disabled, QLabel#Status:disabled {{
+    color: {TEXT_OFF};
+}}
+QSlider::sub-page:horizontal:disabled {{ background: {LINE}; }}
+QSlider::handle:horizontal:disabled {{ background: {LINE_HI}; }}
+
 /* ---------------------------------------------------------------- 滑块 */
 QSlider::groove:horizontal {{
     height: 2px;
@@ -264,6 +282,15 @@ QSplitter::handle:hover {{ background-color: {ACCENT}; }}
 
 /* ---------------------------------------------------------------- 对话框 */
 QDialog {{ background-color: {PANEL}; }}
+
+/* ------------------------------------------------- 对话框里的分级子块 */
+/* 左侧一条竖线 + 缩进：让人一眼看出这几项是从属于上面那个复选框的，
+   不用靠文字说明去解释"勾了才要填" */
+QFrame#SubPanel {{
+    border: none;
+    border-left: 2px solid {LINE_HI};
+    background: transparent;
+}}
 QGroupBox {{
     border: 1px solid {LINE};
     border-radius: 6px;

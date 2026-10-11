@@ -7,6 +7,14 @@ from __future__ import annotations
 
 import numpy as np
 
+from . import style
+
+# 非有限值（NaN / Inf）不画成"某个取值"，而是留成一个**洞**：面板底色 + 全透明。
+# 2D 下透出背景，3D 贴图若不混合也与背景同色，两种情况都不会跟真实取值混淆
+# —— 尤其不会像"取色标的 0 值"那样，和真正的零振幅数据分不开。
+_BG_RGB = tuple(int(style.GL_BG[i:i + 2], 16) for i in (1, 3, 5))
+_MISSING_RGBA = (*_BG_RGB, 0)
+
 # ==================================================================== colormap
 # 用锚点插值定义，避免依赖 matplotlib。
 _ANCHORS: dict[str, list[tuple[float, tuple[float, float, float]]]] = {
@@ -101,15 +109,21 @@ def gradient_strip(name: str, width: int = 128) -> np.ndarray:
 def to_rgba(arr: np.ndarray, cmap: str, clim: tuple[float, float],
             gamma: float = 1.0) -> np.ndarray:
     """二维数组 → (h, w, 4) uint8。拖动色标时只重算这一步，数据不动。"""
+    a = np.asarray(arr, dtype=np.float32)
     lo, hi = float(clim[0]), float(clim[1])
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
         hi = lo + 1e-12
-    x = (np.asarray(arr, dtype=np.float32) - lo) / (hi - lo)
+    x = (a - lo) / (hi - lo)
     if gamma != 1.0:
         np.clip(x, 0.0, 1.0, out=x)
         x = np.power(x, gamma)
-    idx = np.clip(x * 255.0, 0, 255).astype(np.uint8)
-    return lut(cmap)[idx]
+    with np.errstate(invalid="ignore"):          # NaN 位置下面会被盖掉，别刷警告
+        idx = np.clip(x * 255.0, 0, 255).astype(np.uint8)
+    out = lut(cmap)[idx]
+    missing = ~np.isfinite(a)
+    if missing.any():
+        out[missing] = _MISSING_RGBA
+    return out
 
 
 # ==================================================================== wiggle
