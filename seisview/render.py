@@ -12,8 +12,12 @@ from . import style
 # 非有限值（NaN / Inf）不画成"某个取值"，而是留成一个**洞**：面板底色 + 全透明。
 # 2D 下透出背景，3D 贴图若不混合也与背景同色，两种情况都不会跟真实取值混淆
 # —— 尤其不会像"取色标的 0 值"那样，和真正的零振幅数据分不开。
-_BG_RGB = tuple(int(style.GL_BG[i:i + 2], 16) for i in (1, 3, 5))
-_MISSING_RGBA = (*_BG_RGB, 0)
+# 注意**现取**当前主题的画布底色：换主题时"洞"的颜色也要跟着走，否则亮色主题下
+# 会留下一片暗斑。
+def missing_rgba() -> tuple[int, int, int, int]:
+    bg = style.GL_BG
+    return (int(bg[1:3], 16), int(bg[3:5], 16), int(bg[5:7], 16), 0)
+
 
 # ==================================================================== colormap
 # 用锚点插值定义，避免依赖 matplotlib。
@@ -107,8 +111,13 @@ def gradient_strip(name: str, width: int = 128) -> np.ndarray:
 
 # ==================================================================== 上色
 def to_rgba(arr: np.ndarray, cmap: str, clim: tuple[float, float],
-            gamma: float = 1.0) -> np.ndarray:
-    """二维数组 → (h, w, 4) uint8。拖动色标时只重算这一步，数据不动。"""
+            gamma: float = 1.0,
+            missing_rgba: tuple[int, int, int, int] | None = None) -> np.ndarray:
+    """二维数组 → (h, w, 4) uint8。拖动色标时只重算这一步，数据不动。
+
+    ``missing_rgba`` 是坏点（NaN / Inf）填的颜色，默认面板底色。导出"论文用图"
+    时背景是白的，要把它传成白色，否则坏点会变成一块块暗斑。
+    """
     a = np.asarray(arr, dtype=np.float32)
     lo, hi = float(clim[0]), float(clim[1])
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
@@ -122,7 +131,7 @@ def to_rgba(arr: np.ndarray, cmap: str, clim: tuple[float, float],
     out = lut(cmap)[idx]
     missing = ~np.isfinite(a)
     if missing.any():
-        out[missing] = _MISSING_RGBA
+        out[missing] = missing_rgba() if missing_rgba is None else missing_rgba
     return out
 
 
@@ -137,12 +146,17 @@ def choose_wiggle_traces(ntr: int, want: int) -> np.ndarray:
 
 def wiggle_curves(img: np.ndarray, extent: tuple[float, float, float, float],
                   clim: tuple[float, float] = (-1.0, 1.0),
-                  n_traces: int = 60, gain: float = 1.0
+                  n_traces: int = 60, gain: float = 1.0,
+                  scale: float | None = None
                   ) -> list[tuple[np.ndarray, np.ndarray]]:
     """生成 wiggle 波形折线（显示坐标系）。
 
     ``img`` 为 (行, 列) 的二维切片：行是纵轴（时间），列是横轴（道）。
     返回 [(x, y), ...]，每条对应一道，可直接喂给 PlotDataItem。
+
+    ``scale`` 是振幅的分母：省略时按色标半宽归一（画面里看着和色标一致）；
+    传具体数值则按它归一 —— 多数据对比时用来"各道按各自峰值归一化"或
+    "保留绝对振幅差"，与单道波形面板的归一化开关同一套语义。
     """
     rows, cols = img.shape
     x0, x1, y0, y1 = extent
@@ -154,10 +168,12 @@ def wiggle_curves(img: np.ndarray, extent: tuple[float, float, float, float],
     # 每条波形允许的横向摆幅：不超过道间距，避免相互重叠成一团
     half = abs(step) * 0.45 * gain
 
-    lo, hi = float(clim[0]), float(clim[1])
-    if hi <= lo:
-        hi = lo + 1e-12
-    peak = max(abs(lo), abs(hi)) or 1.0
+    if scale:
+        peak = float(scale)
+    else:
+        lo, hi = float(clim[0]), float(clim[1])
+        peak = max(abs(lo), abs(hi)) or 1.0
+    peak = peak or 1.0
 
     y = np.linspace(y0, y1, rows)
     curves: list[tuple[np.ndarray, np.ndarray]] = []

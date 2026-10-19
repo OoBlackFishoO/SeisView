@@ -102,7 +102,8 @@ class VolumeView3D(gl.GLViewWidget):
         self.setBackgroundColor(style.GL_BG)
         # fov 是**水平**视场角；35° 的窄视角透视畸变小，更像工程软件的正投影
         self.opts["fov"] = 35
-        self.setMinimumSize(220, 220)
+        # **不设最小尺寸**：三维面板要能被收放动画压到 0；展开后不被拖扁由所在容器
+        # 的最小尺寸保证（见 main_window._hold_content_min）。
 
         self._vol: SeisVolume | None = None
         self._s = self._r = self._t = 0
@@ -115,6 +116,10 @@ class VolumeView3D(gl.GLViewWidget):
         self._faces: dict[str, gl.GLImageItem] = {}
         self._labels: list[gl.GLTextItem] = []
         self._press_pos: QtCore.QPoint | None = None
+        # 自动取景：为 True 时面板尺寸一变就按记下的视角重算取景距离（用户转过/缩放过
+        # 之后置 False，不再插手）。见 resizeEvent / _refit。
+        self._auto_fit = True
+        self._fit_view: tuple[float, float] | None = None
 
         self._anim = CameraAnimator(self)
         self._anims: list[QtCore.QPropertyAnimation] = []
@@ -180,6 +185,28 @@ class VolumeView3D(gl.GLViewWidget):
         self._labels.clear()
         self._box = None
         self._vol = None
+
+    def restyle(self) -> None:
+        """换主题：画布底色、外框线、轴标签颜色跟着走。
+
+        轴标签只能**重建**（``GLTextItem`` 没有改色接口），手上有数据卷时才重建 ——
+        没数据时标签本来就不存在，重建会去取不存在的 ``_lens``。
+        """
+        self.setBackgroundColor(style.GL_BG)
+        if self._box is not None:
+            try:
+                self._box.setColor(style.GL_BOX)
+            except Exception:                        # pragma: no cover
+                pass
+        if self._vol is not None:
+            for item in list(self._labels):
+                try:
+                    self.removeItem(item)
+                except Exception:                    # pragma: no cover
+                    pass
+            self._labels.clear()
+            self._add_axis_labels()
+        self.update()
 
     # ------------------------------------------------------------ 刷新
     def update_faces(self, s: int, r: int, t: int,
@@ -262,6 +289,10 @@ class VolumeView3D(gl.GLViewWidget):
         ``GLViewWidget`` 的 fov 是水平视场角，竖直方向按面板高宽比换算，
         所以取景距离必须跟着面板形状走，否则窄高面板里物体会显得很小。
         这里把 8 个角点逐个投影求下界，取最大值。
+
+        **注意**：尺寸拿不到时（面板还没展开、宽高为 0）算出来的距离是按"方形视口"
+        估的，会明显偏远 —— 所以结果会连着尺寸一起记下来，等面板真有了尺寸再由
+        :meth:`_refit_when_sized` 补一次取景。
         """
         lx, ly, lz = self._lens
         w, h = max(1, self.width()), max(1, self.height())
@@ -275,6 +306,7 @@ class VolumeView3D(gl.GLViewWidget):
         right = np.cross(fwd, np.array([0.0, 0.0, 1.0]))
         n = float(np.linalg.norm(right))
         if n < 1e-9:
+            self._fit_view = (azimuth, elevation)
             return max(lx, ly, lz) * 1.6
         right /= n
         up = np.cross(right, fwd)
@@ -291,7 +323,35 @@ class VolumeView3D(gl.GLViewWidget):
                     x = abs(float(np.dot(p, right)))
                     y = abs(float(np.dot(p, up)))
                     need = max(need, x / tan_h - along, y / tan_v - along)
+        self._fit_view = (azimuth, elevation)
         return max(1e-6, need * margin)
+
+    def _refit(self) -> None:
+        """按记下的视角重算取景距离（只调距离，不动角度）。"""
+        if self._vol is None or not self._fit_view:
+            return
+        w, h = self.width(), self.height()
+        if w <= 2 or h <= 2:
+            return
+        az, el = self._fit_view
+        self.opts["distance"] = self._fit_distance(az, el)
+        self.update()
+
+    def resizeEvent(self, ev) -> None:               # noqa: N802 （Qt 接口名）
+        """自动取景期间跟着面板形状走。
+
+        这块面板在不同排版下的形状差得很远（细高的右列 / 宽扁的通栏），而取景距离
+        又必须跟着形状算 —— 所以只要用户还没自己转过/缩放过（``_auto_fit``），
+        每次尺寸变化就重新取一次景。载入数据时面板往往还是折叠的（没有尺寸），
+        这一步同时把那种"按退化视口算出来的偏远距离"纠正回来。
+        """
+        super().resizeEvent(ev)
+        if self._auto_fit:
+            self._refit()
+
+    def wheelEvent(self, ev) -> None:                 # noqa: N802 （Qt 接口名）
+        self._auto_fit = False                        # 用户自己缩放过了，别再动取景
+        super().wheelEvent(ev)
 
     def reset_view(self) -> None:
         if self._vol is None:
@@ -302,6 +362,7 @@ class VolumeView3D(gl.GLViewWidget):
         self.opts["azimuth"] = az
         self.opts["elevation"] = el
         self.opts["distance"] = self._fit_distance(az, el)
+        self._auto_fit = True
         self.update()
 
     def focus_face(self, mode: str, animate: bool = True) -> None:
@@ -314,6 +375,7 @@ class VolumeView3D(gl.GLViewWidget):
         self._anims = []
         az, el = _FOCUS.get(mode, (40.0, 22.0))
         dist = self._fit_distance(az, el)
+        self._auto_fit = True               # 换面就是重新取景，之后继续跟着面板尺寸走
         if not animate:
             self.opts["azimuth"], self.opts["elevation"] = az, el
             self.opts["distance"] = dist
@@ -408,6 +470,7 @@ class VolumeView3D(gl.GLViewWidget):
     # ------------------------------------------------------------ 鼠标
     def mousePressEvent(self, ev) -> None:
         self._press_pos = ev.position().toPoint()
+        self._auto_fit = False             # 用户自己开始转视角了 → 不再自动取景
         super().mousePressEvent(ev)
 
     def mouseReleaseEvent(self, ev) -> None:

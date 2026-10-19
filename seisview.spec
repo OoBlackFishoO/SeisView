@@ -18,6 +18,11 @@ HERE = os.path.abspath(os.getcwd())
 
 ICON = os.path.join("assets", "seisview.ico")
 
+# exe 的版本资源：PyInstaller 的 version= 要的是**文件路径**（写成 "0.3.0" 会被当成路径去
+# 找文件而报错）。资源内容见 assets/version_info.txt —— 里面的版本号要与
+# seisview/__init__.py 的 __version__ 保持一致。
+VERSION_TXT = os.path.join("assets", "version_info.txt")
+
 # 用不到的大件，明确排除。PySide6 全量装完 450+ MB，其中 WebEngine 一项就上百 MB；
 # 本程序只用 QtCore/QtGui/QtWidgets/QtOpenGL（pyqtgraph 的 3D 需要 OpenGL）。
 EXCLUDES = [
@@ -79,6 +84,7 @@ exe = EXE(
     console=False,               # 双击不弹黑窗
     disable_windowed_traceback=False,   # 真崩了给个带信息的对话框，别静默退出
     icon=ICON,
+    version=VERSION_TXT,         # 写进 exe 的 FileVersion / ProductVersion
 )
 
 coll = COLLECT(

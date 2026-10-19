@@ -305,15 +305,29 @@ def _write_matrix_file(path: str, arr: np.ndarray, fmt: str) -> None:
         scipy.io.savemat(path, {MAT_ARRAY_KEY: arr})
 
 
+def slice_range(cube: np.ndarray, mode: str,
+                start: int | None = None, stop: int | None = None) -> tuple[int, int]:
+    """把用户给的片层范围夹到合法区间，返回闭区间 ``(lo, hi)``。
+
+    ``start`` / ``stop`` 为 None 表示"从第一片 / 到最后一片"；两值都是闭区间端点的下标。
+    """
+    total = slice_count(cube, mode)
+    lo = 0 if start is None else int(start)
+    hi = total - 1 if stop is None else int(stop)
+    return int(max(0, min(lo, total - 1))), int(max(0, min(hi, total - 1)))
+
+
 def export_slices(folder: str | os.PathLike, cube: np.ndarray, fmt: str, *,
                   mode: str = "shot", name: str = DEFAULT_NAME_PREFIX,
+                  start: int | None = None, stop: int | None = None,
                   progress: Progress | None = None,
                   cancel: Cancel | None = None) -> list[str]:
     """逐剖面导出：沿选定轴切片，每片写成 ``folder`` 下一个独立文件。
 
     ``name`` 是文件名前缀（可留空，留空时文件名就是纯序号）。
-    返回写出的路径列表。中途取消时**已经写完的文件保留**（它们都是完整可用的），
-    只删掉正在写的那一个。
+    ``start`` / ``stop`` 指定**片层范围**（闭区间，下标从 0 起）：只导出这一段的片，
+    省略表示全范围。返回写出的路径列表。中途取消时**已经写完的文件保留**
+    （它们都是完整可用的），只删掉正在写的那一个。
     """
     cube = np.asarray(cube)
     if cube.ndim != 3:
@@ -328,6 +342,11 @@ def export_slices(folder: str | os.PathLike, cube: np.ndarray, fmt: str, *,
     total = slice_count(cube, mode)
     if total <= 0:
         raise ExportError("这个方向上没有可导出的剖面。")
+    lo, hi = slice_range(cube, mode, start, stop)
+    if lo > hi:
+        raise ExportError(f"片层范围不合法：{lo} ~ {hi}（共 {total} 片，下标 0 ~ {total - 1}）。")
+    count = hi - lo + 1
+
     dtype = _native_dtype(cube)
     per_file = int(cube.size // total) * dtype.itemsize
     if per_file > _MATERIALIZE_MAX_BYTES:
@@ -337,7 +356,7 @@ def export_slices(folder: str | os.PathLike, cube: np.ndarray, fmt: str, *,
 
     made: list[str] = []
     try:
-        for i in range(total):
+        for n, i in enumerate(range(lo, hi + 1)):
             _tick(cancel)
             fname = slice_name(name, i, suffix)
             path = os.path.join(folder, fname)
@@ -358,7 +377,7 @@ def export_slices(folder: str | os.PathLike, cube: np.ndarray, fmt: str, *,
                 raise ExportError(f"写「{fname}」失败：{type(exc).__name__}: {exc}") from exc
             made.append(path)
             if progress is not None:
-                progress((i + 1) / total, f"第 {i + 1}/{total} 片 → {fname}")
+                progress((n + 1) / count, f"第 {n + 1}/{count} 片（{word_of(mode)}{i}） → {fname}")
     except _Cancelled:
         raise ExportError(
             f"已取消导出：已经写出 {len(made)} 个文件，都在 {folder}。") from None
@@ -367,14 +386,24 @@ def export_slices(folder: str | os.PathLike, cube: np.ndarray, fmt: str, *,
     return made
 
 
-def describe_slices(cube: np.ndarray, mode: str, fmt: str) -> str:
-    """逐剖面导出的规模说明。"""
+def word_of(mode: str) -> str:
+    """片序号在文件名/提示里代表什么（炮号 / 道号 / 时间采样号）。"""
+    return SLICE_INDEX_WORD.get(mode, "序号")
+
+
+def describe_slices(cube: np.ndarray, mode: str, fmt: str,
+                    start: int | None = None, stop: int | None = None) -> str:
+    """逐剖面导出的规模说明（含片层范围）。"""
     total = slice_count(cube, mode)
+    lo, hi = slice_range(cube, mode, start, stop)
+    count = max(0, hi - lo + 1)
     rows, cols = slice_shape(cube, mode)
     nbytes = rows * cols * 4                    # 统一按 float32 估
-    return (f"沿「{SLICE_LABEL_OF.get(mode, mode)}」共 {total} 片，"
+    scope = (f"全部 {total} 片" if (lo == 0 and hi == total - 1)
+             else f"第 {lo} ~ {hi} 片（{count} 片）")
+    return (f"沿「{SLICE_LABEL_OF.get(mode, mode)}」共 {total} 片，本次导出 {scope}，"
             f"每片 {rows} × {cols}（约 {size_text(nbytes)}）\n"
-            f"将写成 {total} 个 {SUFFIX_OF[fmt]} 文件，总共约 {size_text(nbytes * total)}")
+            f"将写成 {count} 个 {SUFFIX_OF[fmt]} 文件，总共约 {size_text(nbytes * count)}")
 
 
 # ====================================================================== SEG-Y

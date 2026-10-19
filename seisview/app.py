@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6 import QtGui, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import APP_NAME, style
 from .main_window import MainWindow
@@ -30,6 +30,12 @@ def asset_path(name: str) -> Path | None:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
+    # 让所有 OpenGL 上下文共享资源（必须在 QApplication 之前设）。
+    # 三维面板可以整块拉到独立窗口 / 再放回来，控件会被 reparent、GL 上下文随之重建；
+    # 不共享的话，pyqtgraph 缓存在类上的着色器程序在新上下文里全部失效，三维面板
+    # 会变成一片空白并刷一屏 GLError。共享之后程序与顶点缓冲跨上下文仍有效。
+    QtWidgets.QApplication.setAttribute(
+        QtCore.Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
     app = QtWidgets.QApplication(argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_NAME)
