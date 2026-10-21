@@ -80,13 +80,15 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
+from shiboken6 import isValid as _qt_valid
 
 from . import APP_NAME, __version__, export as exporter
-from . import icons, loaders, style, view2d, view3d
+from . import icons, loaders, style, view2d
 from .loaders import LoadError
 from .sample import build_sample_volume
 from .view2d import SlicePanel
-from .volume import (SLICE_LABELS, SeisVolume, agc, compute_clim, decimate, stats)
+from .volume import (SLICE_LABELS, SeisVolume, compute_clim, display_face,
+                     shared_clim, stats)
 from .widgets import (ArrayViewDialog, ColormapCombo, DragLayer, ExportDialog,
                       FloatingPanel, FoldCard, ImportIntentDialog,
                       LAYOUT_GROUP, LAYOUT_KEYS, LAYOUT_TITLE, LayoutPicker,
@@ -118,8 +120,6 @@ LINE_COLORS = [
 LINE_STYLES = [("实线", "solid"), ("虚线", "dash"), ("点线", "dot"), ("点划线", "dashdot")]
 # 默认：数据 1 黑实线 / 数据 2 红实线 / 数据 3 蓝虚线
 DEFAULT_LINE_STYLES = [("#111827", "solid"), ("#D62828", "solid"), ("#1D4ED8", "dash")]
-# 多数据对比的识别色：剖面板标题、单道波形的叠加曲线都用它，一眼对上是哪一份数据
-DATASET_COLORS = [(56, 189, 248, 255), (250, 204, 21, 255), (244, 114, 182, 255)]
 MAX_DATASETS = 3
 AXIS_TITLES = {"shot": "炮点 S", "recv": "检波器 R", "time": "时间 T"}
 
@@ -228,8 +228,8 @@ def pane_header(text: str, handle: bool = True):
     没有折叠三角 —— 面板的种类级显隐统一交给右上角的胶囊。这也是为了避免
     再出现"两种三角长得一样、点下去收掉的东西不一样"的老问题。
 
-    ``handle=False`` 用于"剖面"区域的**组标题**：它本身不可拖（可拖的是里面每一块
-    剖面面板），给抓手只会和面板自己的抓手排在一起，看起来就是"两个六点"。
+    剖面区域的**组标题**也带抓手：拖动它移动的是整个剖面区域（含对比时的所有
+    剖面面板）；组内单幅剖面的换序另用一个 ``⇄`` 小抓手，两者形状不同，不混淆。
     """
     header = QtWidgets.QWidget()
     header.setMouseTracking(True)
@@ -324,43 +324,28 @@ class TraceView(QtWidgets.QWidget):
         self._zero = pg.InfiniteLine(pos=0.0, angle=0, movable=False,
                                      pen=pg.mkPen(style.LINE_HI, width=1))
         self.plot.addItem(self._zero, ignoreBounds=True)
-        try:
-            legend_brush = QtGui.QColor(style.CARD)
-            legend_brush.setAlpha(215)
-            self._legend = self.plot.addLegend(offset=(-10, 10),
-                                               brush=pg.mkBrush(legend_brush),
-                                               pen=pg.mkPen(style.LINE_HI),
-                                               labelTextColor=style.TEXT_DIM)
-        except Exception:                            # pragma: no cover
-            self._legend = None
+        # **屏上不画 pyqtgraph 图例**：对比时它又大又盖波形。识别色改由面板
+        # 标题行的紧凑图例承担（见 MainWindow._sync_trace_legend）；导出的
+        # 论文图另有自己的图例（view2d.build_*_figure），不受这里影响。
         self._curves: list[pg.PlotDataItem] = []
         lay.addWidget(self.plot)
 
     def set_traces(self, traces: list) -> None:
         """``traces`` = ``[(时间, 振幅, (颜色, 线型), 名称), ...]``，按数据顺序叠加。"""
         while len(self._curves) < len(traces):
-            name = traces[len(self._curves)][3]
-            # 图例必须先建再 plot，且名字在创建时就登记
-            self._curves.append(self.plot.plot(name=name))
-        for curve, (t, amp, style_pair, name) in zip(self._curves, traces):
+            self._curves.append(self.plot.plot())
+        for curve, (t, amp, style_pair, _name) in zip(self._curves, traces):
             curve.setData(t, amp)
             curve.setPen(view2d.line_pen(style_pair, 1.4))
-            curve.opts["name"] = name
         for curve in self._curves[len(traces):]:
             curve.setData([], [])
-        if self._legend is not None:
-            self._legend.setVisible(len(traces) > 1)
 
     def clear(self) -> None:
         for curve in self._curves:
             curve.setData([], [])
 
     def restyle(self) -> None:
-        """换主题：画布底、坐标轴、零基准线、图例的底/描边/文字色全部重刷。
-
-        图例是 pyqtgraph 的 GraphicsWidget，它的底色/描边/文字色都不走全局 QSS，
-        必须显式改一遍，否则换到浅色主题后图例会变成"深色小方块"，很扎眼。
-        """
+        """换主题：画布底、坐标轴、零基准线重刷（屏上没有图例）。"""
         self.plot.setBackground(style.GL_BG)
         self.plot.setLabel("bottom", "时间 T (s)", color=style.TEXT_DIM)
         self.plot.setLabel("left", "振幅", color=style.TEXT_DIM)
@@ -372,15 +357,6 @@ class TraceView(QtWidgets.QWidget):
             except Exception:                        # pragma: no cover
                 pass
         self._zero.setPen(pg.mkPen(style.LINE_HI, width=1))
-        if self._legend is not None:
-            try:
-                c = QtGui.QColor(style.CARD)
-                c.setAlpha(215)
-                self._legend.setBrush(pg.mkBrush(c))
-                self._legend.setPen(pg.mkPen(style.LINE_HI))
-                self._legend.setLabelTextColor(style.TEXT_DIM)
-            except Exception:                        # pragma: no cover
-                pass
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -411,6 +387,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.line_styles: list[tuple[str, str]] = list(DEFAULT_LINE_STYLES)
         # 一次刷新周期内缓存各数据源的 (切片, 色标)，供叠加/导出复用
         self._panel_cache: dict[tuple[int, bool], tuple] = {}
+        # 抽稀 + AGC 之后、上色之前的原始显示数组（共享色标与面板共用）
+        self._raw_cache: dict[tuple[int, bool], tuple[np.ndarray, bool]] = {}
+        self._shared_base_cache: tuple[float, float] | None = None
+        self._face_clim_cache: dict[tuple, tuple[float, float]] = {}
+        # 双击复位的“撤销一次取道”：第一次 release 已经改过位置，双击时还原
+        self._pick_undo: dict | None = None
+        # 用户手动 resize 后的尺寸锚：切换构图不再主动缩小（见 _fit_window_to_layout）
+        self._user_size: tuple[int, int] | None = None
+        self._auto_resize_depth = 0        # 程序化改窗口尺寸时加锁，不写入用户锚
+        # 最大化 / 全屏前的窗口几何；退出全屏时显式恢复它（见 changeEvent）
+        self._pre_big_geometry: QtCore.QRect | None = None
         self._overlay_on = False           # 纯波形叠加模式下只有第 0 块在画
         self._overlay_sizes: list[int] | None = None
         self._region_sizes: dict[str, list[int]] = {}
@@ -529,9 +516,13 @@ class MainWindow(QtWidgets.QMainWindow):
         h = min(self.DESIRED_SIZE[1], max(480, int(avail.height() * 0.92)))
         # 最小尺寸也不能超过屏幕，否则照样缩不进屏幕里
         self.setMinimumSize(min(self.MIN_SIZE[0], w), min(self.MIN_SIZE[1], h))
-        self.setGeometry(avail.left() + max(0, (avail.width() - w) // 2),
-                         avail.top() + max(0, (avail.height() - h) // 4),
-                         w, h)
+        self._auto_resize_depth += 1
+        try:
+            self.setGeometry(avail.left() + max(0, (avail.width() - w) // 2),
+                             avail.top() + max(0, (avail.height() - h) // 4),
+                             w, h)
+        finally:
+            self._auto_resize_depth -= 1
 
     def showEvent(self, ev) -> None:
         super().showEvent(ev)
@@ -557,6 +548,17 @@ class MainWindow(QtWidgets.QMainWindow):
             self._freeze_content_width(None)
             self._sync_rail()
 
+    def _default_window_size(self) -> tuple[int, int]:
+        """刚打开软件时用的窗口尺寸（与 _place_window 同一套屏幕余量口径）。"""
+        gui = QtGui.QGuiApplication
+        screen = self.screen() or gui.primaryScreen()
+        if screen is None:
+            return self.DESIRED_SIZE
+        avail = screen.availableGeometry()
+        w = min(self.DESIRED_SIZE[0], max(640, int(avail.width() * 0.92)))
+        h = min(self.DESIRED_SIZE[1], max(480, int(avail.height() * 0.92)))
+        return (w, h)
+
     def _ensure_on_screen(self) -> None:
         """把整个窗口（含标题栏与边框）校正到当前屏幕的可用区域内。"""
         screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
@@ -570,10 +572,14 @@ class MainWindow(QtWidgets.QMainWindow):
         bm = frame.bottom() - geo.bottom()      # 下边框高
         w = min(geo.width(), max(320, avail.width() - lm - rm))
         h = min(geo.height(), max(240, avail.height() - tm - bm))
-        self.setGeometry(
-            max(avail.left() + lm, min(geo.left(), avail.right() - w - rm)),
-            max(avail.top() + tm, min(geo.top(), avail.bottom() - h - bm)),
-            w, h)
+        self._auto_resize_depth += 1
+        try:
+            self.setGeometry(
+                max(avail.left() + lm, min(geo.left(), avail.right() - w - rm)),
+                max(avail.top() + tm, min(geo.top(), avail.bottom() - h - bm)),
+                w, h)
+        finally:
+            self._auto_resize_depth -= 1
 
     # --------------------------------------------------- 位置锚点（auto-fit 不搬窗口）
     def _frame_anchor(self) -> QtCore.QPoint:
@@ -596,8 +602,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if anchor is None:
             anchor = self._frame_anchor()
         off = self._client_offset()
-        self.setGeometry(anchor.x() + off.x(), anchor.y() + off.y(),
-                         max(1, int(w)), max(1, int(h)))
+        self._auto_resize_depth += 1
+        try:
+            self.setGeometry(anchor.x() + off.x(), anchor.y() + off.y(),
+                             max(1, int(w)), max(1, int(h)))
+        finally:
+            self._auto_resize_depth -= 1
 
     def _restore_anchor(self, anchor: QtCore.QPoint | None) -> None:
         """把外框左上角拉回 ``anchor``（改尺寸过程中可能被隐式 resize 挪走）。"""
@@ -606,8 +616,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.frameGeometry().topLeft() == anchor:
             return
         off = self._client_offset()
-        self.setGeometry(anchor.x() + off.x(), anchor.y() + off.y(),
-                         self.width(), self.height())
+        self._auto_resize_depth += 1
+        try:
+            self.setGeometry(anchor.x() + off.x(), anchor.y() + off.y(),
+                             self.width(), self.height())
+        finally:
+            self._auto_resize_depth -= 1
 
     # ================================================================== 界面
     def _build_ui(self) -> None:
@@ -655,7 +669,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_trace()
         self._build_right()
         # 三块容器都允许被压到 0：单视图/分屏切换就是"把尺寸插值到 0"。
-        for w in (self.slice_wrap, self.trace_holder, self.right_holder):
+        for w in (self.slice_holder, self.slice_wrap,
+                  self.trace_holder, self.right_holder):
             w.setSizePolicy(QtWidgets.QSizePolicy.Policy.Ignored,
                             QtWidgets.QSizePolicy.Policy.Ignored)
 
@@ -683,9 +698,9 @@ class MainWindow(QtWidgets.QMainWindow):
         wrap.place_capsule()
         self._sync_split_entry()     # 按窗口设置决定「分屏」按钮出不出现（启动即生效）
 
-        # 三块面板的标题行都挂上同一个拖动手势
-        # 剖面**区域**标题行不挂拖动：可拖的是里面每一块剖面面板，
-        # 组标题再挂一个抓手就会出现并排两个六点（用户一眼就看出不对）。
+        # 三块面板的标题行都挂上拖动：剖面拖的是**整个剖面区域**（组），
+        # 单道/三维拖的是各自的面板。对比时组内每幅剖面另有“只换序”的手势。
+        self._watch_drag(self.slice_header, self.slice_wrap)
         self._watch_drag(self.trace_header, self.trace_frame)
         self._watch_drag(self.right_header, self.right_frame)
 
@@ -847,7 +862,8 @@ class MainWindow(QtWidgets.QMainWindow):
         这里重建的是 **splitter 本身**；三块容器只是被插进新的槽位（``setParent(None)``
         后立刻挂到新分割器上，中间没有任何一次事件循环，视图不会被重建）。
         """
-        leaves = {"slice": self.slice_wrap, "trace": self.trace_holder,
+        self._stop_all_size_anims()
+        leaves = {"slice": self.slice_holder, "trace": self.trace_holder,
                   "right": self.right_holder}
         self._sync_pair_order()
         visit = self._layout_vis()          # 构图按"实际可见"算（被拖出的那块让位）
@@ -1382,22 +1398,43 @@ class MainWindow(QtWidgets.QMainWindow):
         self._group_anim = anim
         anim.start(QtCore.QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
 
-    def _after_group_change(self) -> None:
+    def _after_group_change(self, reset_scroll: bool = False) -> None:
         self._update_group_summaries()
         self._sync_rail()
         self._save_ui_state()
         self._sync_left_empty_hint()
-        self.left_body.verticalScrollBar().setValue(0)
+        if reset_scroll:
+            # 只有“清空数据/回到初始状态”才回顶部；普通展开/收起必须留在原地
+            self.left_body.verticalScrollBar().setValue(0)
 
     def _on_group_toggled(self, key: str, on: bool) -> None:
         """某个分组被收放（点箭头 / 点整行 / 双击标题行）。
 
         不再有"手风琴"联动：多组可以自由同时展开，一组被收掉不影响其他组 ——
         这里是纯粹的"记状态 + 刷摘要"，把每个分组当成一件独立的事。
+        滚动条位置要保住：内容高度变化后按标题行原来的屏幕位置反算，让被点的
+        那一行留在原地（允许为容纳内容做最小必要位移）。
         """
         if self._group_anim_busy:
             return                       # 批量动画自己会收尾，这里不插手
+        card = self.cards[key]
+        bar = self.left_body.verticalScrollBar()
+        inner = self.left_body.widget()
+        top_before = (card.mapTo(inner, QtCore.QPoint(0, 0)).y() - bar.value()
+                      if inner is not None else 0)
         self._after_group_change()
+
+        def _keep_anchor() -> None:
+            content = self.left_body.widget()
+            if content is None:
+                return
+            # 让这张卡的标题行回到收放前的视口 y：滚动值 = 内容内 y − 目标视口 y
+            target = card.mapTo(content, QtCore.QPoint(0, 0)).y() - top_before
+            bar.setValue(max(0, target))
+
+        # 展开动画 160ms；结束后布局才算最终高度，再下一轮事件循环滚动范围才更新
+        QtCore.QTimer.singleShot(FoldCard.ANIM_MS + 30, _keep_anchor)
+        QtCore.QTimer.singleShot(FoldCard.ANIM_MS + 60, _keep_anchor)
 
     # ---------------------------------------------------- 分组摘要（收起时显示）
     def _update_group_summaries(self) -> None:
@@ -1586,6 +1623,7 @@ class MainWindow(QtWidgets.QMainWindow):
         for panel in self.panels:
             panel.restyle()
         self.trace_view.restyle()
+        self._sync_trace_legend(force=True)
         if self.view3d is not None:
             self.view3d.restyle()
         for win in list(self._detached.values()):
@@ -1816,12 +1854,13 @@ class MainWindow(QtWidgets.QMainWindow):
         r2.addWidget(self.spin_manual)
         lay.addLayout(r2)
 
-        self.contrast = SliderRow("对比度", spin=True, suffix=" %")
-        self.contrast.set_range(20, 400, 100)
+        self.contrast = SliderRow("对比度", spin=True, suffix=" %", log=True)
+        self.contrast.set_range(10, 1000, 100)
         self.contrast.set_tooltip(
-            "对比度倍数：100% 就是基准色标窗口。\n"
+            "对比度倍数：100% 就是基准色标窗口。滑杆为**对数刻度**，"
+            "100% 在正中，向两侧每格按比例变化。\n"
             "数值越大 → 窗口越窄 → 被压成纯色（红/蓝）的样点越多、画面越「硬」；\n"
-            "200% ≈ 窗口减半（对比度翻倍），50% ≈ 窗口加倍（画面变柔和）。")
+            "200% ≈ 窗口减半，1000% ≈ 窗口缩到 1/10；50% ≈ 窗口加倍，10% ≈ 放大 10 倍。")
         self.contrast.valueChanged.connect(self._on_contrast)
         lay.addWidget(self.contrast)
 
@@ -2076,7 +2115,10 @@ class MainWindow(QtWidgets.QMainWindow):
         这里**只改颜色、绝不改几何**：以前 AGC 下面挂过一行随时显隐的说明文字，
         一开关就整块重排，看上去就是面板「抖一下」。说明改挂到 tooltip 上了。
         """
-        agc_on = self.chk_agc.isChecked()
+        # 时间切片没有时间轴：AGC 置灰且不施加（勾选状态保留，切回竖直面自动恢复）
+        time_mode = bool(self.datasets) and self.mode == "time"
+        agc_on = self.chk_agc.isChecked() and not time_mode
+        self.chk_agc.setEnabled(not time_mode)
         self.lab_agc.setEnabled(agc_on)
         self.combo_agc.setEnabled(agc_on)
         self.lab_clim.setEnabled(not agc_on)
@@ -2118,16 +2160,27 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # -------------------------------------------------------------- 剖面区
     def _build_slice(self) -> None:
-        """剖面容器：并排若干块（单数据 1 块，对比时 2~3 块）+ 空状态引导。"""
+        """剖面容器：并排若干块（单数据 1 块，对比时 2~3 块）+ 空状态引导。
+
+        剖面区在布局树里是一个整体：**组标题行**承担“整块移动 / 拉出 / 换分屏”，
+        对比时组内的每幅剖面只保留“交换数据顺序”的专用抓手。这样三个界面的
+        六点抓手都在各自区域的左上角，语义也一致。
+        """
+        holder = QtWidgets.QWidget()
+        hl = QtWidgets.QVBoxLayout(holder)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(0)
+        self.slice_holder = holder
+
         wrap, lay = make_panel()
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
         self.slice_header, self.slice_head, self.slice_title = pane_header(
-            "剖面", handle=False)
+            "剖面", handle=True)
         # 操作提示只挂在这根标题行上（别挂在画面上，否则鼠标一停就挡住波形）
         self.slice_header.setToolTip(
-            "左键拖动平移、滚轮缩放、双击复位；点一下取该位置的道。\n"
-            "标题行左端拖动 = 换序 / 拉出独立窗口 / 拖到工作区边缘换分屏方式。")
+            "整块拖动 = 移动 / 拉出独立窗口 / 拖到工作区边缘换分屏方式。\n"
+            "画面：左键拖动平移、滚轮缩放、双击复位；点一下取该位置的道。")
         lay.addWidget(self.slice_header)
         self.slice_frame = wrap
 
@@ -2147,6 +2200,7 @@ class MainWindow(QtWidgets.QMainWindow):
         lay.addWidget(self.slice_empty, 1)
         self.slice_empty.setVisible(False)
         self.slice_wrap = wrap
+        hl.addWidget(wrap)
 
     # -------------------------------------------------------------- 单道波形
     def _build_trace(self) -> None:
@@ -2163,8 +2217,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.trace_header.setToolTip(
             "这条道取自剖面上被点中的位置；对比模式下各数据源用不同颜色叠在一起。\n"
             "画面上：滚轮缩放、左键拖动平移；标题行左端拖动 = 拉出独立窗口 / 换分屏方式。")
-        self.trace_info = ValueLabel("--")
+        self.trace_info = ValueLabel("—")
         self.trace_head.addWidget(self.trace_info)
+        # 紧凑图例：只有对比模式才出现，小色条 + 数据序号，替代屏上那块大图例
+        self.trace_legend = QtWidgets.QWidget()
+        self._trace_legend_lay = QtWidgets.QHBoxLayout(self.trace_legend)
+        self._trace_legend_lay.setContentsMargins(0, 0, 0, 0)
+        self._trace_legend_lay.setSpacing(4)
+        self.trace_legend.setVisible(False)
+        self._trace_legend_key: tuple | None = None
+        self.trace_head.addWidget(self.trace_legend)
         self.trace_head.addSpacing(24)     # 给浮窗右上角那颗"收回"按钮留出位置
         lay2.addWidget(self.trace_header)
         self.trace_view = TraceView()
@@ -2226,6 +2288,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # 先后**同集合保序**（拖动贴边/拖动落位时不要把用户换过的顺序复位）
         self._align_pair_order(first)
         self._three_auto_closed = False
+        if self._content_shown.get("right"):
+            self._ensure_view3d()
         self._suppress_window_resize = True          # 窗口尺寸交给动画滑过去
         try:
             self._build_work_tree()
@@ -2256,6 +2320,8 @@ class MainWindow(QtWidgets.QMainWindow):
         一定落在设计好的那三种两栏构图上。
         """
         vis = self._layout_vis()
+        if "right" in vis:
+            self._ensure_view3d()
         if force_default:
             # "块数变化 → 回到默认构图"，**连同它的先后**：否则用户以前「⇄」翻过的那套会留着，
             # 看上去就像"默认没生效"（先后也是默认的一部分）。
@@ -2321,10 +2387,8 @@ class MainWindow(QtWidgets.QMainWindow):
         这时只看 ``_detached`` 是找不到它们的 —— 所以按面板上的 ``floating`` 属性扫一遍，
         作为最后一道安全网。
         """
-        strays = [p for p in self.panels if p.property("floating")]
-        for widget in (self.trace_frame, self.right_frame):
-            if widget.property("floating"):
-                strays.append(widget)
+        strays = [w for w in (self.slice_wrap, self.trace_frame, self.right_frame)
+                  if w.property("floating")]
         for widget in strays:
             self._detached.pop(widget, None)
             self._restore_detached(widget)
@@ -2340,8 +2404,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 kind, 20, style.TEXT if on else style.TEXT_MUTE, style.ACCENT, on)))
             btn.setToolTip(self._capsule_tip(key, on))
         n = len(self.panels)
-        self.capsule.set_slice_dots(
-            n, [self.panels[k] in self._detached for k in range(n)])
+        group_floating = self._is_detached(self.slice_wrap)
+        self.capsule.set_slice_dots(n, [group_floating] * n)
         f1, f2 = (self._pair_order + ["", ""])[:2]
         can_swap = bool(f2)
         dim = style.TEXT_DIM
@@ -2419,6 +2483,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if key == "right":
             # 用户自己动了三维面板，就别再让"二维数据自动收起"覆盖他的选择
             self._three_auto_closed = False
+            if self._content_shown.get("right"):
+                self._ensure_view3d()
         self._sync_layout_for_count()
 
     def _focus_panel(self, key: str) -> None:
@@ -2440,6 +2506,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._reclaim(PANEL_ORDER)
         self._content_shown = {k: (k == key) for k in PANEL_ORDER}
         self._three_auto_closed = False
+        if key == "right":
+            self._ensure_view3d()
         self._relayout_content(animate=True)
         self.status.setText(
             f"已切到「{PANEL_LABELS[key]}」独看（按 1/2/3 或 Tab 换一块；"
@@ -2647,10 +2715,19 @@ class MainWindow(QtWidgets.QMainWindow):
         # 细长竖面：宽度被 400 下限抬起后，再把高度夹到"宽 / 显示比例下限"，
         # 免得剖面变成 400 × 805 这种竖长条（见 SLICE_MIN_DISPLAY_ASPECT 的说明）。
         s_nat_h = min(s_nat_h, s_nat_w / self.SLICE_MIN_DISPLAY_ASPECT)
+        # 上面两项是**单幅剖面**的尺寸。对比模式下剖面组里并排 N 幅，整组的自然
+        # 宽度必须是 N × 单幅，否则每幅只能拿到 1/N 宽度、画面被拉成竖条 ——
+        # “优先保证剖面比例”的规则必须落在每一幅上，而不是整组上。
+        n_slice = max(1, len(self.panels))
+        gutter = (self.slice_split.handleWidth() * (n_slice - 1)
+                  if getattr(self, "slice_split", None) is not None else 0)
+        group_nat_w = s_nat_w * n_slice + gutter
+        group_min_w = (320.0 if n_slice == 1
+                       else max(320.0, 220.0 * n_slice))
         t_nat_h = min(260.0, max(150.0, nt * 0.30))
         r_nat_w = min(560.0, max(300.0, 0.42 * s_nat_w))
         return {
-            "slice": {"min_w": 320.0, "min_h": 180.0, "nat_w": s_nat_w,
+            "slice": {"min_w": group_min_w, "min_h": 180.0, "nat_w": group_nat_w,
                       "nat_h": s_nat_h, "prio": PANEL_PRIORITY["slice"]},
             "trace": {"min_w": 200.0, "min_h": 150.0, "nat_w": 520.0,
                       "nat_h": t_nat_h, "prio": PANEL_PRIORITY["trace"]},
@@ -2786,7 +2863,7 @@ class MainWindow(QtWidgets.QMainWindow):
                       [pi(k, axis) for k in tree["slots"]]))
         return plans
 
-    _LEAF_OF = {"slice": "slice_wrap", "trace": "trace_holder", "right": "right_holder"}
+    _LEAF_OF = {"slice": "slice_holder", "trace": "trace_holder", "right": "right_holder"}
 
     def _prio_of(self, widget, shown: dict, m: dict) -> float:
         """某个容器（或其子树）里最高的让位优先级 —— 0 表示整棵子树都收起了。"""
@@ -2906,8 +2983,8 @@ class MainWindow(QtWidgets.QMainWindow):
         与旧版最大的区别是**它也会变小** —— 关掉一块时窗口就收回去，而不是留下空白
         把剩下的块拉变形。
 
-        两条保险：窗口设置里可以关掉这个行为（关掉后退回"只放大"）；用户给某个组合
-        手动调过的尺寸会被记住（``_combo_sizes``），切回那个组合时至少给到这个尺寸 ——
+        两条保险：窗口设置里可以关掉这个行为（关掉后退回"只放大"）；用户手动 resize
+        过的尺寸成为**锚点**（``_user_size``），换构图只在空间不足时扩容、不主动缩小 ——
         于是"调好的大小"不会因为切一趟别的视图就丢掉。
         """
         if self._tree is None or self.work_tree is None or not self.datasets:
@@ -2934,12 +3011,25 @@ class MainWindow(QtWidgets.QMainWindow):
             cw = max(0.0, float(self.width() - self.work_host.width() - left_w))
         if self.work_host.height() > 1 and self.height() > self.work_host.height():
             ch = float(self.height() - self.work_host.height())
-        win_w = left_w + want_w + cw
-        win_h = want_h + ch
-        if not self._follow_layout:
-            # 关掉"跟随排版"就退回旧行为：只要不小于现在，绝不缩回去
-            win_w = max(win_w, float(self.width()))
-            win_h = max(win_h, float(self.height()))
+        # 当前构图**真正放不下**时的最小窗口（只用于用户尺寸锚的扩容判断）
+        min_w = left_w + self._min_along(self.work_tree, True, shown, m) + cw
+        min_h = self._min_along(self.work_tree, False, shown, m) + ch
+
+        if self._user_size is not None:
+            # 用户手动调过尺寸：它成为锚点，换构图**不主动缩小**；只有这个构图
+            # 连最小尺寸都放不下时才扩容。
+            win_w = max(float(self._user_size[0]), min_w)
+            win_h = max(float(self._user_size[1]), min_h)
+            if not self._follow_layout:
+                win_w = max(win_w, float(self.width()))
+                win_h = max(win_h, float(self.height()))
+        else:
+            win_w = left_w + want_w + cw
+            win_h = want_h + ch
+            if not self._follow_layout:
+                # 关掉"跟随排版"就退回旧行为：只要不小于现在，绝不缩回去
+                win_w = max(win_w, float(self.width()))
+                win_h = max(win_h, float(self.height()))
 
         screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
         if screen is not None:
@@ -2948,6 +3038,13 @@ class MainWindow(QtWidgets.QMainWindow):
             win_h = min(win_h, avail.height() * 0.94)
         win_w = max(win_w, float(self.MIN_SIZE[0]))
         win_h = max(win_h, float(self.MIN_SIZE[1]))
+
+        # 全屏 / 最大化下**只重排 splitter，绝不 setGeometry**：否则会退出全屏
+        if self.isFullScreen() or self.isMaximized():
+            self._window_target = None
+            return (max(60, int(self.work_host.width())),
+                    max(60, int(self.work_host.height())))
+
         self._window_target = (int(win_w), int(win_h))
 
         # **拖动中不改窗口尺寸**：挤占会改变"实际可见集合"，而窗口尺寸又是跟着它算的
@@ -2988,6 +3085,8 @@ class MainWindow(QtWidgets.QMainWindow):
         但窗口尺寸可以：面板在窗口里是按伸缩因子等比例铺开的，窗口从旧尺寸滑到新
         尺寸时整幅画面一起"呼吸"，就不会出现"内容先跳一下、窗口再跟上"的错位感。
         """
+        if self.isFullScreen() or self.isMaximized():
+            return                      # 全屏下只重排 splitter，绝不改窗口 geometry
         target = getattr(self, "_window_target", None)
         if target is None or not self.isVisible():
             return
@@ -3021,6 +3120,16 @@ class MainWindow(QtWidgets.QMainWindow):
         except RuntimeError:                   # DeleteWhenStopped 已经把对象删了
             pass
 
+    def _window_anim_running(self) -> bool:
+        """总窗口的尺寸动画是否还在跑（动画帧不该写入用户尺寸锚）。"""
+        anim = getattr(self, "_layout_anim", None)
+        if anim is None:
+            return False
+        try:
+            return anim.state() == QtCore.QAbstractAnimation.State.Running
+        except RuntimeError:                   # pragma: no cover
+            return False
+
     # 窗口尺寸的"边框开销"：左右外边距 + body 手柄 + 顶栏 + 状态栏（估算兜底用；
     # 实测拿得到时优先用实测值，见 _fit_window_to_layout）。
     CHROME_W = 34
@@ -3041,18 +3150,52 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
         return False
 
+    def changeEvent(self, ev) -> None:           # noqa: N802 （Qt 接口名）
+        """最大化 / 全屏切换时显式恢复“进全屏前”的几何。
+
+        Windows 上无边框/自定义布局窗口有时只改了 ``windowState``，几何仍停在
+        最大化尺寸，看起来就是“点了还原按钮却没缩小”。这里在状态回到 NoState
+        时主动把 normalGeometry 再落一次，保证缩回进全屏前的大小。
+        """
+        super().changeEvent(ev)
+        if ev.type() != QtCore.QEvent.Type.WindowStateChange:
+            return
+        state = self.windowState()
+        if state & (QtCore.Qt.WindowState.WindowMaximized
+                    | QtCore.Qt.WindowState.WindowFullScreen):
+            geo = self.normalGeometry()
+            if geo.isValid() and not geo.isNull():
+                self._pre_big_geometry = QtCore.QRect(geo)
+            return
+        if state & QtCore.Qt.WindowState.WindowMinimized:
+            return
+        geo, self._pre_big_geometry = self._pre_big_geometry, None
+        if geo is None or not geo.isValid() or not self.isVisible():
+            return
+        self._auto_resize_depth += 1
+        try:
+            self.setGeometry(geo)
+        finally:
+            self._auto_resize_depth -= 1
+        # 恢复后的尺寸就是用户尺寸锚，后续排版不会把它撑回去
+        self._user_size = (geo.width(), geo.height())
+
     def resizeEvent(self, ev) -> None:           # noqa: N802 （Qt 接口名）
         """窗口尺寸一变，就按新的可用空间重新判定各块的最小尺寸约束。
 
         空间不够时 ``_hold_content_min`` 会自动放开约束，避免子控件被裁切 ——
         这样"窗口被用户拖小"不会把某一块压出画面。动画进行中不插手。
 
-        另外：**用户手动改的尺寸不记也不还**。曾经按"每个视图组合记一个尺寸"做过，
-        但那样会让同一个剖面在不同组合下大小不一（三块时窗口被记成很宽、剖面被拉宽，
-        切到只看剖面又回到自然宽度），而"剖面大小与比例"是第一优先级 —— 所以取消了
-        记忆：窗口尺寸每次都按当前排版的自然尺寸重算，剖面在任何组合下都拿到同一个大小。
+        同时记录**用户尺寸锚**：只有用户自己拖动窗口（非程序化、非最大化/全屏、
+        非换构图动画）才更新 ``_user_size``；换构图只在这个锚点放不下时才扩容。
         """
         super().resizeEvent(ev)
+        if (self._auto_resize_depth == 0
+                and getattr(self, "_place_done", False)
+                and not self._window_anim_running()
+                and self.windowState() == QtCore.Qt.WindowState.WindowNoState
+                and self.isVisible()):
+            self._user_size = (self.width(), self.height())
         # right_holder 是这几块里最晚建出来的，它有 = 工作区各控件都齐了
         if getattr(self, "right_holder", None) is None or self._layout_animating():
             return
@@ -3065,6 +3208,27 @@ class MainWindow(QtWidgets.QMainWindow):
         控件自己吃掉（根本传不到这里），于是"往抽稀框里敲 4096"不会被当成快捷键 ——
         这正是我们要的。焦点在普通按钮上时才会落到这里。
         """
+        mod = ev.modifiers()
+        if (ev.key() == QtCore.Qt.Key.Key_Escape
+                and mod == QtCore.Qt.KeyboardModifier.NoModifier):
+            # Esc 优先级：先收浮窗，再退全屏 / 最大化（避免全屏时误退）
+            if self._detached:
+                widget = list(self._detached)[-1]
+                self._close_detached(widget)
+                return
+            if self.isFullScreen() or self.isMaximized():
+                normal = self.normalGeometry()
+                self._auto_resize_depth += 1
+                try:
+                    self.showNormal()
+                    if normal.isValid():
+                        self.setGeometry(normal)
+                finally:
+                    self._auto_resize_depth -= 1
+                if normal.isValid():
+                    self._user_size = (normal.width(), normal.height())
+                return
+
         focus = QtWidgets.QApplication.focusWidget()
         if isinstance(focus, (QtWidgets.QAbstractSpinBox, QtWidgets.QLineEdit,
                               QtWidgets.QComboBox)):
@@ -3119,21 +3283,36 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         def _finish(sp=splitter, t=target, cb=on_done):
+            if not _qt_valid(sp):              # 旧 splitter 已被换摆法销毁
+                return
             sp.setSizes(list(t))
             if cb is not None:
                 cb()
+
+        def _frame(v, sp=splitter, s=start, t=target):
+            if not _qt_valid(sp):
+                return
+            sp.setSizes([int(round(a + (b - a) * float(v)))
+                         for a, b in zip(s, t)])
 
         anim = QtCore.QVariantAnimation(self)
         anim.setDuration(duration)
         anim.setStartValue(0.0)
         anim.setEndValue(1.0)
         anim.setEasingCurve(QtCore.QEasingCurve.Type.InOutCubic)
-        anim.valueChanged.connect(
-            lambda v, sp=splitter, s=start, t=target:
-            sp.setSizes([int(round(a + (b - a) * float(v))) for a, b in zip(s, t)]))
+        anim.valueChanged.connect(_frame)
         anim.finished.connect(_finish)
         self._size_anims[id(splitter)] = anim
         anim.start(QtCore.QAbstractAnimation.DeletionPolicy.DeleteWhenStopped)
+
+    def _stop_all_size_anims(self) -> None:
+        """换树 / 清空数据前停掉所有 splitter 尺寸动画（它们的目标可能马上被销毁）。"""
+        for anim in list(self._size_anims.values()):
+            try:
+                anim.stop()
+            except RuntimeError:               # pragma: no cover
+                pass
+        self._size_anims.clear()
 
     def _stop_size_anim(self, splitter: QtWidgets.QSplitter) -> None:
         """掐掉同一根 splitter 上还没跑完的上一轮动画，免得两批动画互相抢。"""
@@ -3174,6 +3353,9 @@ class MainWindow(QtWidgets.QMainWindow):
             panel.slot = 0
             panel.picked.connect(lambda c, r, p=panel: self._on_pick(p.slot, c, r))
             panel.hovered.connect(lambda c, r, p=panel: self._on_hover(p.slot, c, r))
+            # 双击复位：第一次 release 可能已经误取道，这里把那次变化撤回去
+            panel.view.doubleClicked.connect(
+                lambda p=panel: self._on_view_double_click(p.slot))
             # 拖动统一挂到主窗口这一处实现（拉出为独立窗口 / 拖到另一块上换序）
             self._watch_drag(panel.header, panel)
             # 这里**故意不给**剖面面板挂 tooltip：鼠标一停在地震画面上就会冒出一块
@@ -3260,6 +3442,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return True
 
     def _drag_kind(self, target) -> str:
+        if target is self.slice_wrap:
+            return "slice"
         if isinstance(target, SlicePanel):
             return "slice"
         if target is self.trace_frame:
@@ -3299,9 +3483,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self._preview_state = None         # 上一次拖动的预览状态不许影响这一次
         self._preview_cap = None
         self._zone_frozen = None
+        kind = self._drag_kind(target)
+        # 剖面有两种手势：
+        #   · 组标题（slice_wrap）→ 整块移动 / 拉出 / 换分屏；
+        #   · 单图标题（SlicePanel）→ 只在对比模式交换数据顺序，绝不拉出。
+        group = target is self.slice_wrap
+        reorder_only = isinstance(target, SlicePanel)
+        slice_sizes = (list(self.slice_split.sizes())
+                       if reorder_only and len(self.panels) > 1 else None)
         self._drag = {"header": header, "target": target, "press": pos,
-                      "size": target.size(),
-                      "window": win, "active": False,
+                      "size": target.size(), "slice_sizes": slice_sizes,
+                      "window": win, "active": False, "group": group,
+                      "reorder_only": reorder_only,
                       "freeze": False, "blocked": False,
                       "offset": None, "intent": None,
                       "layer": None, "ghost": None}
@@ -3315,9 +3508,17 @@ class MainWindow(QtWidgets.QMainWindow):
             if (pos - d["press"]).manhattanLength() <= self._DRAG_SLOP:
                 return
             kind = self._drag_kind(d["target"])
+            if d.get("reorder_only") and len(self.panels) <= 1:
+                if not d.get("blocked"):
+                    d["blocked"] = True
+                    self.status.setText(
+                        "单幅剖面不能拖出；整块移动请拖上方「剖面」标题行。")
+                return
             # 工作区只剩它这一块时**不允许拖走**（松手回原位）：拖出去会变成空工作区，
             # "让位"也没有别的块可铺。浮窗（本来就在窗外）不受这条限制 —— 拖回来才是它的用途。
-            if d["window"] is None and not self._visible_excluding(kind):
+            # 对比换序不涉及“把块拖走”，所以不适用这条限制。
+            if (d["window"] is None and not d.get("reorder_only")
+                    and not self._visible_excluding(kind)):
                 if not d.get("blocked"):
                     d["blocked"] = True
                     self.status.setText(
@@ -3354,17 +3555,21 @@ class MainWindow(QtWidgets.QMainWindow):
         拖窗内面板与拖浮窗走的是**同一套**判定，所以看到什么、松手就是什么。
         """
         kind = self._drag_kind(d["target"])
-        intent = self._drop_intent_at(pos, kind, exclude)
+        intent = self._drop_intent_at(
+            pos, kind, exclude,
+            group=bool(d.get("group")), reorder=bool(d.get("reorder_only")))
         d["intent"] = intent
         self._apply_drag_preview(kind, intent)
 
-    def _drag_is_reorder(self, kind: str) -> bool:
-        """这次拖动是不是"对比模式下换数据顺序"（窗口里 ≥2 块剖面时拖其中一块剖面）。
+    def _drag_is_reorder(self) -> bool:
+        """这次拖动是不是"对比模式下换数据顺序"（拖的是组内某幅剖面）。
 
-        那种情况下工作区**不该让位**：剖面区还在（别的剖面板占着它的位置），换的只是
-        数据顺序 —— 让位会把整个剖面组抽掉，光标底下的目标块跟着跑，判定就全乱了。
+        组标题的拖动不算换序：它移动的是整个剖面区域。换序时工作区**不该让位**：
+        剖面组还在（别的剖面板占着它的位置），换的只是数据顺序 —— 让位会把整个
+        剖面组抽掉，光标底下的目标块跟着跑，判定就全乱了。
         """
-        return kind == "slice" and len(self.panels) > 1
+        d = self._drag
+        return bool(d and d.get("reorder_only") and len(self.panels) > 1)
 
     def _enter_drag_layout(self, kind: str) -> None:
         """面板一"离手"就**立刻让位**：当作它已经不在窗口里，剩下几块按预设铺满。
@@ -3372,7 +3577,7 @@ class MainWindow(QtWidgets.QMainWindow):
         这就是需求里的"窗口内剩余界面自动按预设填充空间、不再保留占位"：原来那块原位
         会留一个虚线占位框（GhostSlot），现在是它的槽位直接消失、邻居立刻吃掉。
         """
-        if self._drag_is_reorder(kind):
+        if self._drag_is_reorder():
             return
         self._drag_vis.add(kind)
         self._preview_dock.discard(kind)
@@ -3411,7 +3616,7 @@ class MainWindow(QtWidgets.QMainWindow):
         拖动中每一帧都重排会卡。
         """
         wrap = getattr(self, "workspace", None)
-        if self._drag_is_reorder(kind):
+        if self._drag_is_reorder():
             # 对比模式换数据顺序：**不让位**，只用面板上的高亮条提示目标块
             if wrap is not None:
                 wrap.show_drop_preview(None)
@@ -3563,18 +3768,24 @@ class MainWindow(QtWidgets.QMainWindow):
         return (rx, ry if side == "first" else ry + rh - h, rw, h)
 
     def _drop_intent_at(self, global_pos: QtCore.QPoint, kind: str,
-                        exclude=None) -> dict | None:
+                        exclude=None, *, group: bool = False,
+                        reorder: bool = False) -> dict | None:
         """松手会产生的结果；``None`` 表示没有落位（=按"拉出为独立窗口"处理）。
 
         * ``{"side": …, "target": (摆法键, 第一块)}`` → 插到工作区的某一侧（左/上 或 右/下）
         * ``{"panel": 面板, "zone": "left"/"right"/None}`` → 插到某块剖面旁边 / 与它换位
-          （只在**对比模式**、即窗口里有 ≥2 块剖面时才走这条 —— 那是"换数据顺序"，与
-          上面的插入是两件事，所以它优先判定，免得被新规则吃掉）
+          （只在**对比模式**、即窗口里有 ≥2 块剖面、且拖的是组内单图时才走这条）
+
+        ``group=True`` 表示拖的是整个剖面区域：它只按工作区边缘落位，永远不走
+        “换数据顺序”那一条，否则整组拖动会被面板换序规则吞掉。
         """
-        if kind == "slice" and len(self.panels) > 1:
+        if not group and kind == "slice" and len(self.panels) > 1:
             drop = self._drop_zone_at(global_pos, exclude=exclude)
             if drop is not None:
                 return {"panel": drop[0], "zone": drop[1]}
+        if reorder:
+            # 单图拖动只允许“落到另一幅剖面上换序”，不参与工作区边缘的停靠
+            return None
         side = self._zone_side_at(global_pos, kind)
         if side is not None:
             target = self._drop_target(kind, side)
@@ -3593,7 +3804,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if k == kind or not self._content_shown.get(k):
                 continue
             if k == "slice":
-                if self.panels and any(not self._is_detached(p) for p in self.panels):
+                if self.panels and not self._is_detached(self.slice_wrap):
                     out.append(k)
             elif k == "trace":
                 if not self._is_detached(self.trace_frame):
@@ -3606,7 +3817,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _region_above(self, key: str) -> tuple:
         """某块面板**上方**那一整块的相对区域（0~1）；那块看不见时退回整个工作区。"""
         wrap = getattr(self, "workspace", None)
-        holder = {"slice": self.slice_wrap, "trace": self.trace_holder,
+        holder = {"slice": self.slice_holder, "trace": self.trace_holder,
                   "right": self.right_holder}[key]
         if wrap is None or wrap.height() <= 1 or holder.height() <= 0:
             return (0.0, 0.0, 1.0, 1.0)
@@ -3705,10 +3916,26 @@ class MainWindow(QtWidgets.QMainWindow):
         return ("AL", "right") if side == "first" else ("A", "right")
 
     def _open_drag_layer(self, d: dict) -> None:
-        """面板"离手"：**不再留原位占位**（那块槽位马上被邻居吃掉），手上跟一个半透明快照。"""
+        """面板"离手"：抓快照并隐藏原面板。
+
+        整组 / 普通面板隐藏后让位（邻居吃掉槽位）；对比换序只让**画面**消失，
+        槽位宽度钉住，避免邻居先胀后缩。
+        """
         target = d["target"]
+        # 快照必须在隐藏**之前**抓，否则拿到的是空白图
+        snap = self._panel_snapshot(target)
+        if d.get("reorder_only"):
+            # 换序时原面板要消失（手上拿着它），但**槽位宽度必须钉住**：
+            # 否则邻居会立刻吃掉这块宽度，松手再恢复就成了“面板先缩再弹回来”。
+            try:
+                holder = self.panel_holders[self.panels.index(target)]
+            except (ValueError, IndexError):
+                holder = None
+            if holder is not None and holder.width() > 1:
+                d["pinned_holder"] = holder
+                holder.setFixedWidth(holder.width())
         target.setVisible(False)
-        layer = DragLayer(self._panel_snapshot(target))
+        layer = DragLayer(snap)
         layer.show()
         d["layer"] = layer
 
@@ -3752,10 +3979,26 @@ class MainWindow(QtWidgets.QMainWindow):
             self._highlight_panel(p, False)
 
         intent = d.get("intent")
-        if intent is not None and self._inside_main_window(pos):
+        # 换序发生在浮动组内部时，光标本来就在主窗口外，不能因此拒绝落位
+        accept = (intent is not None
+                  and (self._inside_main_window(pos)
+                       or (d.get("reorder_only") and "panel" in intent)))
+        if accept:
             self._discard_drag_layer(d, restore=True)
             self._clear_drag_layout(relayout=False)  # 别多排一次：下面 _apply_intent 会落最终构图
             self._apply_intent(d, intent)
+            if "panel" in intent and d.get("slice_sizes"):
+                # 换序 = 只换数据顺序：各剖面块必须保持松手前的像素尺寸，
+                # 绝不触发 splitter / window geometry 重排。
+                sizes = list(d["slice_sizes"])
+                QtCore.QTimer.singleShot(
+                    0, lambda s=sizes: self.slice_split.setSizes(s))
+            return
+        if d.get("reorder_only"):
+            # 单图拖动只用于换序：没有落到另一幅剖面上就原样回去，绝不拉出/让位
+            self._discard_drag_layer(d, restore=True)
+            self._clear_drag_layout()
+            self.status.setText("拖到另一幅剖面上即可交换数据顺序。")
             return
         self._discard_drag_layer(d, restore=True)
         if d["window"] is not None:
@@ -3783,6 +4026,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self._move_panel_near(d["target"], other, zone)   # 侧边 → 插入
 
     def _discard_drag_layer(self, d: dict, restore: bool) -> None:
+        holder = d.get("pinned_holder")
+        if holder is not None:
+            # 换序结束：解除宽度钉住，交回 splitter / _sync_holder_widths 管理
+            try:
+                holder.setMinimumWidth(0)
+                holder.setMaximumWidth(16777215)
+            except RuntimeError:                # pragma: no cover
+                pass
+            d["pinned_holder"] = None
         if d.get("ghost") is not None:
             d["ghost"].setParent(None)
             d["ghost"].deleteLater()
@@ -3800,6 +4052,22 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------------------------------------------------------- 拉出
     def _tear_off(self, d: dict, pos: QtCore.QPoint) -> None:
         target = d["target"]
+        kind = self._drag_kind(target)
+        # **全屏 / 最大化下拖出面板 = 自动退出**，并回到进全屏前的窗口几何；
+        # 浮窗尺寸用面板在正常窗口里的自然尺寸封顶，避免弹出和屏幕一样大的窗口。
+        was_big = self.isFullScreen() or self.isMaximized()
+        normal = self.normalGeometry() if was_big else None
+        if was_big:
+            self._auto_resize_depth += 1
+            try:
+                self.showNormal()
+                if normal is not None and normal.isValid():
+                    self.setGeometry(normal)
+            finally:
+                self._auto_resize_depth -= 1
+            if normal is not None and normal.isValid():
+                self._user_size = (normal.width(), normal.height())
+
         self._clear_drag_layout(relayout=False)   # 拉出前先撤掉瞬时的让位/预览状态
         offset = d["offset"] or QtCore.QPoint(0, 0)
         # 尺寸**与窗内一致**：拉出就是"原样搬出去"，不放大也不缩小。
@@ -3809,6 +4077,11 @@ class MainWindow(QtWidgets.QMainWindow):
         stamp = d.get("size") or target.size()
         w = max(self.MIN_FLOAT[0], stamp.width())
         h = max(self.MIN_FLOAT[1], stamp.height())
+        if was_big:
+            metrics = self._panel_metrics().get(kind)
+            if metrics:
+                w = min(w, max(self.MIN_FLOAT[0], metrics["nat_w"]))
+                h = min(h, max(self.MIN_FLOAT[1], metrics["nat_h"]))
         screen = self.screen()
         if screen is not None:
             avail = screen.availableGeometry()
@@ -3856,6 +4129,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _restore_detached(self, widget) -> None:
         """按控件类型放回它在主窗口里的原位。"""
         FloatingPanel._set_floating(widget, False)
+        if widget is self.slice_wrap:
+            # 整个剖面区域作为一个浮窗单元收回：放回外层占位容器
+            self.slice_holder.layout().addWidget(widget)
+            widget.setVisible(True)
+            return
         if isinstance(widget, SlicePanel):
             if widget in self.panels:
                 self.panel_holders[self.panels.index(widget)].layout().addWidget(widget)
@@ -3946,15 +4224,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _sync_holder_widths(self) -> None:
         """剖面面板容器的宽度分配。
 
-        被拉到独立窗口的那一块、以及"仅显示波形叠加"模式下非第 0 块，都压到 0 宽；
-        其余按之前的比例补齐（用"压宽度"而不是隐藏控件：QSplitter 重新显示子控件
-        会把尺寸重排，压到 0 则原尺寸能原样恢复）。
+        剖面的整组移动/浮窗由外层 `slice_holder` 负责；这里只处理**组内**的
+        “仅显示波形叠加”（非第 0 块压到 0 宽）。其余按之前的比例补齐（用
+        “压宽度”而不是隐藏控件：QSplitter 重新显示子控件会把尺寸重排）。
         """
         n = len(self.panel_holders)
         if n == 0:
             return
-        hidden = [self._is_detached(self.panels[k]) or (self._overlay_on and k > 0)
-                  for k in range(n)]
+        hidden = [self._overlay_on and k > 0 for k in range(n)]
         for k, holder in enumerate(self.panel_holders):
             holder.setMinimumWidth(0)
             holder.setMaximumWidth(0 if hidden[k] else 16777215)
@@ -4016,21 +4293,22 @@ class MainWindow(QtWidgets.QMainWindow):
         card, lay = make_panel()
         self.right_body = card
         self._right_body_layout = lay       # 收回独立窗口时按这个下标插回去
-        self.view3d = view3d.create_view3d()
-        # 这里**不给**三维控件设最小高度：它一设就变成"钉死的下限"，把折叠态撑成一条
-        # 200px 的空条（收不起来）。真要保证展开后不被拖扁，交给 _hold_content_min
-        # 给"容器"设最小尺寸 —— 那样收放动画仍然能把它压到 0。
-        if self.view3d is not None:
-            self.view3d.faceClicked.connect(self._focus_face)
-            lay.addWidget(self.view3d, 1)
-        else:
-            fallback = QtWidgets.QLabel(
-                "三维视图不可用（未能创建 OpenGL 上下文）。\n"
-                "剖面与波形功能不受影响。")
-            fallback.setObjectName("Hint")
-            fallback.setWordWrap(True)
-            fallback.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            lay.addWidget(fallback, 1)
+        # **延迟创建三维视图**：打开软件时只建二维界面，省掉 pyqtgraph.opengl
+        # 那一秒多的 import。等这块面板真的要显示、或载入三维数据时再建。
+        self.view3d = None
+        self._view3d_failed = False
+        self._view3d_creating = False
+        self._view3d_slot = QtWidgets.QWidget()
+        self._view3d_slot_lay = QtWidgets.QVBoxLayout(self._view3d_slot)
+        self._view3d_slot_lay.setContentsMargins(0, 0, 0, 0)
+        self._view3d_slot_lay.setSpacing(0)
+        self._view3d_placeholder = QtWidgets.QLabel(
+            "三维视图在需要时加载…\n（首次显示三维面板或载入三维数据）")
+        self._view3d_placeholder.setObjectName("Hint")
+        self._view3d_placeholder.setWordWrap(True)
+        self._view3d_placeholder.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self._view3d_slot_lay.addWidget(self._view3d_placeholder, 1)
+        lay.addWidget(self._view3d_slot, 1)
 
         # 底部一行：当前面的紧凑读数 + 「复位视角」
         row = QtWidgets.QHBoxLayout()
@@ -4056,6 +4334,42 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addWidget(card, 1)
         self.right_wrap = wrap
         hh.addWidget(wrap)
+
+    def _ensure_view3d(self):
+        """按需创建三维视图；创建失败就在原位给出说明。
+
+        三维面板默认是收起的，启动时没有必要为它 import OpenGL。这里只在
+        “面板真的要显示 / 有三维数据要画”时调用一次；之后复用同一个 GL 控件。
+        """
+        if self.view3d is not None or self._view3d_failed or self._view3d_creating:
+            return self.view3d
+        self._view3d_creating = True
+        self.status.setText("正在准备三维视图…")
+        # **不要在这里 processEvents**：那会让右栏先画出“占位文字”，
+        # 紧接着又被 GL 控件替换，导入数据时看起来就是闪一下。
+        # 同步建好后再一起进布局，事件循环只会看到最终状态。
+        try:
+            from . import view3d as view3d_mod  # 延迟到此刻才 import OpenGL
+            view = view3d_mod.create_view3d()
+            if view is None:
+                self._view3d_failed = True
+                self._view3d_placeholder.setText(
+                    "三维视图不可用（未能创建 OpenGL 上下文）。\n"
+                    "剖面与波形功能不受影响。")
+                self._view3d_placeholder.setVisible(True)
+                self.status.setText("三维视图不可用；剖面与波形照常。")
+                return None
+            self.view3d = view
+            view.faceClicked.connect(self._focus_face)
+            self._view3d_slot_lay.addWidget(view, 1)
+            self._view3d_placeholder.setVisible(False)
+            if self.datasets:
+                view.set_volume(self.vol)
+                view.focus_face(self.mode, animate=False)
+                self._refresh_faces()
+            return view
+        finally:
+            self._view3d_creating = False
 
     def _top_right_owner(self) -> str | None:
         """工作区**右上角**那块面板是谁 —— 悬浮胶囊压在它上面，标题行要给它让位。
@@ -4124,9 +4438,9 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         drag = self._drag_vis
         dock = self._preview_dock
-        slice_on = self._content_shown["slice"]
-        if slice_on and self.panels:
-            slice_on = any(not self._is_detached(p) for p in self.panels)
+        # 剖面是一个整体：只有整组被拉到独立窗口时才让出主窗口里的槽位
+        slice_on = (self._content_shown["slice"]
+                    and not self._is_detached(self.slice_wrap))
         return {"slice": (slice_on or "slice" in dock) and "slice" not in drag,
                 "trace": ((self._content_shown["trace"]
                            and not self._is_detached(self.trace_frame))
@@ -4167,30 +4481,54 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._region_shown["left"] = bool(on)
         total = self._total(self.body_split)
+        old_left = max(self.LEFT_RAIL_W, self.left_wrap.width())
+        old_win = self.width()
+        old_right = max(1, self.workspace.width())
+        chrome = max(0, old_win - old_left - old_right)
         self._sync_rail()
 
         if not on:
             self._region_sizes["left"] = list(self.body_split.sizes())
+            new_left = self.LEFT_RAIL_W
+        else:
+            saved = self._region_sizes.get("left")
+            new_left = (saved[0] if saved and len(saved) == 2 and sum(saved) > 120
+                        else self._left_min_w)
+
+        # 侧边栏收起不是“空间不足”，不该让工作区去吸收它让出的宽度：
+        # 总窗口等量反向变化，右侧各块维持原来的像素尺寸。
+        can_resize_window = not (self.isFullScreen() or self.isMaximized())
+        if can_resize_window:
+            avail = (self.screen() or QtGui.QGuiApplication.primaryScreen())
+            max_w = (avail.availableGeometry().width() if avail is not None else 10 ** 6)
+            new_win = min(float(old_win) + (new_left - old_left), max_w)
+            new_win = max(new_win, float(self.MIN_SIZE[0]))
+            if abs(new_win - old_win) > 1:
+                self._resize_keeping_anchor(int(new_win), self.height())
+            right_w = max(1, self.width() - new_left - chrome)
+            actual_delta = self.width() - old_win
+            if self._user_size is not None:
+                self._user_size = (max(1, self._user_size[0] + actual_delta),
+                                   self._user_size[1])
+        else:
+            # 全屏 / 最大化：窗口不能动，只能把空间在内部重新分配
+            right_w = max(1, total - new_left)
+
+        if not on:
             self.left_wrap.setMinimumWidth(0)
             self.left_wrap.setMaximumWidth(16777215)
             self._freeze_content_width(self.left_content.width())
             self.status.setText("已收起设置面板（点左侧图标轨道展开）。")
-            self._apply_sizes(self.body_split,
-                              [self.LEFT_RAIL_W, max(1, total - self.LEFT_RAIL_W)],
+            self._apply_sizes(self.body_split, [new_left, right_w],
                               animate, on_done=self._pin_left_rail)
         else:
             self.left_wrap.setMinimumWidth(0)
             self.left_wrap.setMaximumWidth(16777215)
-            saved = self._region_sizes.get("left")
-            if saved and len(saved) == 2 and sum(saved) > 120:
-                target = list(saved)
-            else:
-                target = [self._left_min_w, max(1, total - self._left_min_w)]
             self.left_content.setVisible(True)
             # 同样先把内容钉在最终宽度上：动画里只有"露出来的部分"在变，内部不重排
-            self._freeze_content_width(max(120, target[0] - self.LEFT_RAIL_W - 6))
+            self._freeze_content_width(max(120, new_left - self.LEFT_RAIL_W - 6))
             self.status.setText("已展开设置面板。")
-            self._apply_sizes(self.body_split, target, animate,
+            self._apply_sizes(self.body_split, [new_left, right_w], animate,
                               on_done=self._pin_left_open)
         self._save_ui_state()
 
@@ -4416,17 +4754,33 @@ class MainWindow(QtWidgets.QMainWindow):
         那是齿轮里管的事，与"清空数据"不是一回事。
         """
         self._stop()
+        self._stop_layout_anim()
+        self._stop_all_size_anims()       # 面板/树马上要销毁，别让旧动画继续摸它们
         # 拉出去的浮窗先收回主窗口：否则数据清了，那些窗口还孤零零留在桌面上
         for widget in list(self._detached):
             self._close_detached(widget, silent=True)
 
         # ---- 数据集合
+        # 先把每块面板的图 / 叠加曲线 / 提示线 / 读数显式复位，再移除面板与数据。
+        # 只依赖 deleteLater 的话，对比多面板 + 浮窗/缓存的组合下容易留残影。
+        for panel in list(self.panels):
+            panel.reset_view_state()
+
         self.datasets = []
         self.active = 0
         self._base_clims = []
         self._clims = []
+        self._clim = (-1.0, 1.0)
         self._stats = {"min": 0.0, "max": 0.0, "mean": 0.0, "rms": 0.0}
         self._panel_cache.clear()
+        self._raw_cache.clear()
+        self._shared_base_cache = None
+        self._face_clim_cache.clear()
+        self._pick_undo = None
+        # 清空数据 = 回到“刚打开”的状态：用户尺寸锚也要一并清掉，
+        # 否则窗口会一直保持清空前那个（可能被对比数据撑大的）尺寸。
+        self._user_size = None
+        self._window_target = None
         self._overlay_on = False
         self._overlay_sizes = None
         self._is_2d = False
@@ -4445,7 +4799,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cmap_combo.setCurrentIndex(2)          # 红蓝（地震惯例）
         self.clim_combo.setCurrentIndex(0)          # 自动
         self.spin_manual.setValue(1.0)
-        self.contrast.set_range(20, 400, 100)
+        self.contrast.set_range(10, 1000, 100)
         self._clim_scale = 1.0                      # set_range 不发声，得手动同步内部状态
         self.chk_agc.setChecked(False)
         self.combo_agc.setCurrentIndex(0)
@@ -4472,8 +4826,9 @@ class MainWindow(QtWidgets.QMainWindow):
             spin.setRange(0, 0)
             spin.setValue(0)
         self.slice_title.setText("剖面")
-        self.trace_info.setText("--")
+        self.trace_info.setText("—")
         self.trace_view.clear()
+        self._sync_trace_legend(force=True)
 
         # ---- 面板布局：只开剖面（与刚打开一致），构图回到默认（_default3_key，没配过就是 B）
         self._content_shown = {"slice": True, "trace": False, "right": False}
@@ -4496,7 +4851,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_panel_chips()
         self._sync_gated_controls()
         self._sync_compare_controls()
-        self._after_group_change()
+        self._after_group_change(reset_scroll=True)
+        # 回到刚打开的窗口尺寸；全屏/最大化时保持窗口状态不变
+        if not (self.isFullScreen() or self.isMaximized()):
+            w, h = self._default_window_size()
+            self._resize_keeping_anchor(w, h)
+            self._ensure_on_screen()
         self._relayout_content(animate=True)
         self._update_references()
         self._update_status()
@@ -4580,6 +4940,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_export.setEnabled(True)
         self.btn_clear.setEnabled(True)
         self.trace_view.clear()
+        if self._content_shown.get("right"):
+            self._ensure_view3d()          # 三维数据/三维面板要显示时才建 GL 控件
         if self.view3d is not None:
             self.view3d.set_volume(self.vol)
             self.view3d.focus_face(self.mode, animate=False)
@@ -4589,8 +4951,14 @@ class MainWindow(QtWidgets.QMainWindow):
         summary = self.vol.meta.get("summary")     # SEG-Y/SU 带自己的载入摘要
         if summary:
             self.src_info.setText(summary)
-        # 数据规模变了 → 三块的自然尺寸与窗口尺寸都要按新数据重算一遍
-        self._relayout_content(animate=False)
+        # 数据规模变了 → 三块的自然尺寸与窗口尺寸都要按新数据重算一遍。
+        # 窗口尺寸用一次短动画滑过去，避免导入瞬间“跳一下”被看成闪烁。
+        self._suppress_window_resize = True
+        try:
+            self._relayout_content(animate=False)
+        finally:
+            self._suppress_window_resize = False
+        self._animate_layout_change()
 
     def _default_view_for(self, two_d: bool) -> None:
         """按数据维度给一次**默认排版**。
@@ -4651,19 +5019,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._base_clims[k] = compute_clim(sample, self.clim_combo.currentData(),
                                           self.spin_manual.value())
 
-    def _scaled_clim(self, k: int,
-                     base: tuple[float, float] | None = None) -> tuple[float, float]:
-        """把第 k 份数据的基准窗口按对比度缩放。
-
-        ``base`` 省略时用缓存的自动基准；AGC 开启时基准是逐切片重算的，
-        由调用方传进来。两种情况下对比度都照常生效 —— 它只是围绕窗口中点
-        对称地收紧或放宽，与基准怎么来的无关。
-        """
-        lo, hi = self._base_clims[k] if base is None else base
-        mid = 0.5 * (lo + hi)
-        half = max(1e-12, 0.5 * (hi - lo) * self._clim_scale)
-        return (mid - half, mid + half)
-
     # ============================================================== 导出 / 转换
     def export_volume(self) -> None:
         """导出：整卷数据 / 逐剖面（可范围）/ 当前剖面图片，统一在这一个对话框里。"""
@@ -4691,15 +5046,30 @@ class MainWindow(QtWidgets.QMainWindow):
         prog.setAutoClose(False)
         prog.setAutoReset(False)
         prog.setValue(0)
-        last = [-1]
+        # 显示值平滑追赶真实目标：算得出的段给真实百分比，算不出的段（序列化）
+        # 停在 99% + 确定性文案。全程只增不减、不跳变。
+        chaser = {"shown": 0, "target": 0, "text": ""}
+
+        def tick() -> None:
+            shown, target = chaser["shown"], chaser["target"]
+            if shown >= target:
+                return
+            step = max(1, int(np.ceil((target - shown) * 0.25)))
+            chaser["shown"] = min(target, shown + step)
+            prog.setValue(chaser["shown"])
+
+        timer = QtCore.QTimer(self)
+        timer.setInterval(40)
+        timer.timeout.connect(tick)
+        timer.start()
 
         def on_progress(frac: float, text: str) -> None:
             pct = int(max(0.0, min(1.0, frac)) * 100)
-            if pct == last[0]:                  # 别为了报进度把事件循环淹了
-                return
-            last[0] = pct
-            prog.setValue(pct)
-            prog.setLabelText(text)
+            chaser["target"] = max(chaser["target"], pct)
+            if text != chaser["text"]:
+                chaser["text"] = text
+                prog.setLabelText(text)
+            # 即使百分比没变也要泵事件：序列化写盘期间界面靠这里保持重绘
             QtWidgets.QApplication.processEvents()
 
         self._stop()
@@ -4707,6 +5077,7 @@ class MainWindow(QtWidgets.QMainWindow):
             content = dlg.content()
             if content in ("slice_image", "wave_image"):
                 made = self._export_figures(dlg, on_progress)
+                timer.stop()
                 prog.setValue(100)
                 prog.close()
                 self.status.setText(
@@ -4715,6 +5086,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
             if content == "slices":
                 made = self._export_slices(dlg, on_progress, prog.wasCanceled)
+                timer.stop()
                 prog.setValue(100)
                 prog.close()
                 self.status.setText(
@@ -4726,13 +5098,16 @@ class MainWindow(QtWidgets.QMainWindow):
                                   with_coords=dlg.with_coords(),
                                   progress=on_progress, cancel=prog.wasCanceled)
         except exporter.ExportError as exc:
+            timer.stop()
             prog.close()
             self._error("导出失败", str(exc))
             return
         except Exception as exc:                            # pragma: no cover
+            timer.stop()
             prog.close()
             self._error("导出失败", f"{type(exc).__name__}: {exc}")
             return
+        timer.stop()
         prog.setValue(100)
         prog.close()
         size = Path(out).stat().st_size
@@ -4882,12 +5257,20 @@ class MainWindow(QtWidgets.QMainWindow):
         while len(self._clims) < len(self.datasets):
             self._clims.append(self._base_clims[len(self._clims)])
         self._panel_cache.clear()          # 每轮刷新重算一次切片，供叠加/统计复用
+        self._raw_cache.clear()
+        self._shared_base_cache = None
+        self._face_clim_cache.clear()
         # 仅显示波形 + 对比时只有第 0 块在画（上面叠了所有数据源的曲线）
         overlay = self.chk_pure.isChecked() and len(self.datasets) > 1
         for k in range(len(self.datasets)):
             if overlay and k > 0:
                 continue
             self._refresh_panel(k)
+        # 共享色标：即使某一块这轮没重绘（叠层模式），它的导出色标也要跟着一致
+        shared = self._scale_window(self._shared_base_clim())
+        self._clims = [shared] * len(self.datasets)
+        if self.datasets:
+            self._clim = self._clims[self.active]
         self._apply_overlay_layout(overlay)
         self._refresh_faces()
         self._refresh_trace()
@@ -4899,7 +5282,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_group_summaries()
 
     def _refresh_panel(self, k: int) -> None:
-        """画第 k 份数据的剖面（含它自己的色标，两份数据的量级不同也各自合适）。"""
+        """画第 k 份数据的剖面；对比时三块共用同一套色标窗口。"""
         ds = self.datasets[k]
         img, clim = self._panel_image(k)
         pure = self.chk_pure.isChecked()
@@ -4927,10 +5310,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # 对比面板的小标题带识别色 + 同色小图例，一眼看出这块是哪份数据、
         # 屏上它的曲线是什么颜色（导出用另一套线型，见「导出线型」分组）
         screen_styles = view2d.screen_line_styles(len(self.datasets))
+        title_rgb = tuple(QtGui.QColor(
+            screen_styles[k % len(screen_styles)][0]).getRgb())
         self.panels[k].set_title(
-            f"{ds.vol.name}　{suffix}", DATASET_COLORS[k % len(DATASET_COLORS)],
+            f"{ds.vol.name}　{suffix}", title_rgb,
             show=len(self.datasets) > 1,
             line_style=screen_styles[k % len(screen_styles)])
+        # 单数据时组内只有一幅：换序抓手隐藏，整块移动统一用上方「剖面」组把手
+        self.panels[k].set_reorder_affordance(len(self.datasets) > 1)
         # 记下这一片实际用的色标：导出"论文用图"时要和屏幕上一致
         self._clims[k] = clim
         if k == self.active:
@@ -4939,32 +5326,108 @@ class MainWindow(QtWidgets.QMainWindow):
             self._stats = stats(np.asarray(img[::4, ::4], dtype=np.float32))
         self._update_reference_panel(k)
 
+    def _agc_window(self, mode: str) -> int | None:
+        """当前设置下这一面该用的 AGC 窗口；时间切片没有时间轴，一律 None。"""
+        if mode == "time" or not self.chk_agc.isChecked():
+            return None
+        return int(self.combo_agc.currentData() or 0)
+
+    def _processed_image(self, k: int, full: bool = False):
+        """第 k 份数据当前切片 → ``(抽稀/AGC 后的二维数组, 是否施加了 AGC)``。
+
+        只走 ``volume.display_face`` 这一条计算链；面板、wiggle、共享色标、三维
+        贴图都从这里取数，禁止在别处再写一份 AGC / 抽稀。
+        """
+        key = (k, full)
+        hit = self._raw_cache.get(key)
+        if hit is not None:
+            return hit
+        ds = self.datasets[k]
+        limit = None if full else (self.combo_dec.currentData() or None)
+        agc_window = self._agc_window(ds.mode)
+        img = display_face(ds.vol, ds.mode, ds.pos[ds.mode],
+                           max_side=limit, agc_window=agc_window)
+        out = (img, agc_window is not None)
+        self._raw_cache[key] = out
+        return out
+
+    def _shared_base_clim(self) -> tuple[float, float]:
+        """对比模式下三块面板共用的基准色标窗口。
+
+        AGC 开启时按 AGC 后的数据取稳健口径（2%/98%），否则按用户在
+        「色标上限」里选的口径；多份数据把样本拼在一起统计，于是三块面板的
+        ``中值 ± 半宽`` 完全相同，振幅强弱可以直接比较。
+        """
+        if self._shared_base_cache is not None:
+            return self._shared_base_cache
+        if not self.datasets:
+            base = (-1.0, 1.0)
+        elif len(self.datasets) == 1:
+            img, agc_on = self._processed_image(0)
+            base = (compute_clim(img, "robust") if agc_on
+                    else self._base_clims[0])
+        else:
+            imgs, agc_any = [], False
+            for k in range(len(self.datasets)):
+                img, agc_on = self._processed_image(k)
+                imgs.append(img)
+                agc_any = agc_any or agc_on
+            base = shared_clim(
+                imgs,
+                "robust" if agc_any else self.clim_combo.currentData(),
+                self.spin_manual.value())
+        self._shared_base_cache = base
+        return base
+
+    def _scale_window(self, base: tuple[float, float]) -> tuple[float, float]:
+        """把基准窗口按对比度围绕中点对称缩放。"""
+        lo, hi = base
+        mid = 0.5 * (lo + hi)
+        half = max(1e-12, 0.5 * (hi - lo) * self._clim_scale)
+        return (mid - half, mid + half)
+
     def _panel_image(self, k: int, full: bool = False):
-        """第 k 份数据当前切片 → ``(显示用数组, 该数据的色标窗口)``。
+        """第 k 份数据当前切片 → ``(显示用数组, 全体共享的色标窗口)``。
 
         面板显示、wiggle 叠加、导出的论文图都走这一个入口，保证"看到的"和"导出的"
-        用的是同一套 AGC / 色标口径。``full=True`` 时不抽稀（导出图要细节）。
-        同期内结果会缓存，避免叠加模式下同一片被反复计算。
+        用的是同一套 AGC / 抽稀 / 色标口径。``full=True`` 时不抽稀（导出图要细节），
+        但色标仍与屏幕上的共享窗口一致。
         """
         key = (k, full)
         hit = self._panel_cache.get(key)
         if hit is not None:
             return hit
-        ds = self.datasets[k]
-        img = ds.vol.take_slice(ds.mode, ds.pos[ds.mode])
-        if not full:
-            limit = self.combo_dec.currentData() or 10 ** 9
-            img = decimate(img, max_cols=limit, max_rows=limit)
-        if self.chk_agc.isChecked():
-            # AGC 把振幅按道归一化了，基准窗口固定用稳健口径（2%/98%）逐片重算；
-            # 对比度仍在这之上缩放，所以滑块不会因为开了 AGC 就失效。
-            img = agc(img, int(self.combo_agc.currentData() or 0))
-            clim = self._scaled_clim(k, compute_clim(img, "robust"))
-        else:
-            clim = self._scaled_clim(k)
+        img, _agc_on = self._processed_image(k, full)
+        clim = self._scale_window(self._shared_base_clim())
         if not full:
             self._panel_cache[key] = (img, clim)
         return img, clim
+
+    def _clim_for_face(self, mode: str) -> tuple[float, float]:
+        """三维里**非当前**两个面的色标：同样按共享窗口的口径逐面重算。"""
+        if self.datasets and mode == self.mode and self.active < len(self._clims):
+            return self._clims[self.active]
+        limit = self.combo_dec.currentData() or None
+        agc_window = self._agc_window(mode)
+        key = (mode,
+               tuple(ds.pos[mode] for ds in self.datasets),
+               agc_window, self.clim_combo.currentData(),
+               float(self.spin_manual.value()), float(self._clim_scale))
+        hit = self._face_clim_cache.get(key)
+        if hit is not None:
+            return hit
+        imgs = [display_face(ds.vol, mode, ds.pos[mode],
+                             max_side=limit, agc_window=agc_window)
+                for ds in self.datasets]
+        base = shared_clim(
+            imgs,
+            "robust" if agc_window is not None else self.clim_combo.currentData(),
+            self.spin_manual.value())
+        clim = self._scale_window(base)
+        if len(self._face_clim_cache) > 48:
+            self._face_clim_cache.clear()
+        self._face_clim_cache[key] = clim
+        return clim
 
     def _wiggle_set(self, k: int, shared: float | None = None) -> tuple:
         """第 k 份数据在剖面上叠加用的 wiggle 数据组（**屏幕用**）。
@@ -4992,7 +5455,8 @@ class MainWindow(QtWidgets.QMainWindow):
         return [self._wiggle_set(j, shared) for j in range(n)]
 
     def _update_references(self) -> None:
-        for k in range(len(self.panels)):
+        # 清空数据时面板是先于 datasets 移除的，期间索引必须按两者较小值来走
+        for k in range(min(len(self.panels), len(self.datasets))):
             self._update_reference_panel(k)
 
     def _update_reference_panel(self, k: int) -> None:
@@ -5008,6 +5472,9 @@ class MainWindow(QtWidgets.QMainWindow):
         仍然看得见，提示线就该留着）。
         """
         if k >= len(self.panels):
+            return
+        if k >= len(self.datasets):
+            self.panels[k].view.set_reference(None)
             return
         panel = self.panels[k]
         ds = self.datasets[k]
@@ -5027,13 +5494,28 @@ class MainWindow(QtWidgets.QMainWindow):
         panel.view.set_reference(x0 + (x1 - x0) * frac, f"S={s}  R={r}")
 
     def _refresh_faces(self) -> None:
-        if self.view3d is None or not self.datasets:
+        """三维三个面：当前面的数组与二维面板**同源**，另外两面按同一口径算。"""
+        if not self.datasets:
             return
-        agc_window = (int(self.combo_agc.currentData() or 0)
-                      if self.chk_agc.isChecked() else None)
+        if self.view3d is None:
+            if self._content_shown.get("right"):
+                self._ensure_view3d()
+            if self.view3d is None:
+                return
+        ds = self.datasets[self.active]
+        limit = self.combo_dec.currentData() or None
+        faces: dict[str, tuple[np.ndarray, tuple[float, float]]] = {}
+        for mode in ("shot", "recv", "time"):
+            if mode == ds.mode:
+                # **直接复用**二维面板这一轮的数组与色标：max|diff| 必须为 0
+                img, clim = self._panel_image(self.active)
+            else:
+                img = display_face(ds.vol, mode, ds.pos[mode],
+                                   max_side=limit, agc_window=self._agc_window(mode))
+                clim = self._clim_for_face(mode)
+            faces[mode] = (img, clim)
         self.view3d.update_faces(self.pos["shot"], self.pos["recv"], self.pos["time"],
-                                 self.cmap_combo.cmap(), self._clim,
-                                 agc_window=agc_window)
+                                 faces, self.cmap_combo.cmap())
         self._update_face_info()
 
     def _traces(self) -> tuple[list, list, tuple[int, int]]:
@@ -5062,12 +5544,45 @@ class MainWindow(QtWidgets.QMainWindow):
                 sr = (s, r)
         return traces, peaks, sr
 
+    def _sync_trace_legend(self, force: bool = False) -> None:
+        """标题行右侧的紧凑图例：小色条 + 数据序号，只有对比模式才显示。
+
+        屏上不再画那块的 pyqtgraph 大图例（它会盖住波形）；导出的论文图仍由
+        ``view2d.build_*_figure`` 带完整图例。
+        """
+        if not hasattr(self, "trace_legend"):
+            return
+        key = (len(self.datasets), self._theme_key)
+        if not force and key == self._trace_legend_key:
+            return
+        self._trace_legend_key = key
+        lay = self._trace_legend_lay
+        while lay.count():
+            item = lay.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if len(self.datasets) <= 1:
+            self.trace_legend.setVisible(False)
+            return
+        styles = view2d.screen_line_styles(len(self.datasets))
+        for k, (color, _dash) in enumerate(styles):
+            swatch = QtWidgets.QLabel()
+            swatch.setFixedSize(18, 10)
+            swatch.setPixmap(view2d.line_swatch_pixmap((color, "solid"), 18, 10))
+            lay.addWidget(swatch)
+            name = QtWidgets.QLabel(f"数据{k + 1}")
+            name.setStyleSheet(f"color: {color}; font-size: 11px;")
+            lay.addWidget(name)
+        self.trace_legend.setVisible(True)
+
     def _refresh_trace(self) -> None:
         """单道波形：每份数据一条曲线，用**屏幕调色板**（数据识别色）叠加。"""
         if not self.datasets:
             return
         traces, peaks, (s, r) = self._traces()
         self.trace_view.set_traces(traces)
+        self._sync_trace_legend()
         if len(self.datasets) > 1:
             self.trace_info.setText(
                 f"叠加 {len(self.datasets)} 条　当前 数据{self.active + 1}"
@@ -5191,9 +5706,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self.active = int(index)
         self.mode_ctl.set_value(self.mode)
+        if self._content_shown.get("right"):
+            self._ensure_view3d()
         if self.view3d is not None:
             self.view3d.set_volume(self.vol)
             self.view3d.focus_face(self.mode, animate=False)
+        self._sync_gated_controls()          # 各数据源模式可能不同 → AGC 可用性跟着变
         self._refresh_all()
         self._update_face_info()
 
@@ -5210,6 +5728,7 @@ class MainWindow(QtWidgets.QMainWindow):
                           "time": min(src.pos["time"], ds.vol.nt - 1)}
             self.status.setText("已把当前数据的剖面参数同步到其余数据。")
         self._sync_compare_controls()
+        self._sync_gated_controls()
         if self.datasets:
             self._refresh_all()
 
@@ -5220,7 +5739,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.chk_sync.isChecked():
             for ds in self.datasets:
                 ds.mode = key
+        self._sync_gated_controls()      # 时间切片要把 AGC 置灰
         self._refresh_all()
+        if self._content_shown.get("right"):
+            self._ensure_view3d()
         if self.view3d is not None:
             self.view3d.focus_face(key)
 
@@ -5308,6 +5830,13 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         if not self.datasets or not (0 <= k < len(self.datasets)):
             return
+        # 双击复位的第一次 release 也会走到这里：先留一份撤销快照，双击时还原
+        self._pick_undo = {
+            "slot": k,
+            "t": time.monotonic(),
+            "active": self.active,
+            "pos": [dict(d.pos) for d in self.datasets],
+        }
         self.active = k
         ds = self.datasets[k]
         vol, mode = ds.vol, ds.mode
@@ -5334,6 +5863,27 @@ class MainWindow(QtWidgets.QMainWindow):
         self._update_references()
         self._sync_controls()
         self._update_status()
+
+    def _on_view_double_click(self, slot: int) -> None:
+        """双击复位视野：把双击手势里第一次 release 造成的取道撤回去。
+
+        双击在 Qt 里是 ``press → release → dblclick → release``，第一个 release
+        已经发过 ``picked``。若不在双击时还原，绿线与单道波形会留在双击点，
+        看起来就像"复位把绿线挪走了"。
+        """
+        undo, self._pick_undo = self._pick_undo, None
+        if undo is None or undo["slot"] != slot:
+            return
+        limit = (QtWidgets.QApplication.doubleClickInterval() / 1000.0) * 1.5
+        if time.monotonic() - undo["t"] > limit:
+            return
+        if len(undo["pos"]) != len(self.datasets):
+            return
+        for ds, pos in zip(self.datasets, undo["pos"]):
+            ds.pos = dict(pos)
+        self.active = min(max(undo["active"], 0), len(self.datasets) - 1)
+        self._refresh_all()
+        self._update_face_info()
 
     def _on_hover(self, k: int, col: int, row: int) -> None:
         if not (0 <= k < len(self.datasets)) or k >= len(self.panels):

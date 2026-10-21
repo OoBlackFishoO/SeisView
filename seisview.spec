@@ -18,7 +18,7 @@ HERE = os.path.abspath(os.getcwd())
 
 ICON = os.path.join("assets", "seisview.ico")
 
-# exe 的版本资源：PyInstaller 的 version= 要的是**文件路径**（写成 "0.3.0" 会被当成路径去
+# exe 的版本资源：PyInstaller 的 version= 要的是**文件路径**（写成 "0.3.1" 会被当成路径去
 # 找文件而报错）。资源内容见 assets/version_info.txt —— 里面的版本号要与
 # seisview/__init__.py 的 __version__ 保持一致。
 VERSION_TXT = os.path.join("assets", "version_info.txt")

@@ -35,7 +35,7 @@ from PySide6 import QtCore, QtGui
 from shiboken6 import isValid
 
 from . import render, style
-from .volume import (SeisVolume, agc, compute_clim, downscale_for_texture)
+from .volume import SeisVolume
 
 
 class CameraAnimator(QtCore.QObject):
@@ -88,8 +88,6 @@ _FOCUS = {
 
 # 显示缩放：最短轴至少占最长轴的这一比例
 _MIN_AXIS_FRAC = 0.45
-# 三维面贴图每边的最大像素（只是缩略图，主视图仍走全分辨率）
-_TEX_SIDE = 512
 
 
 class VolumeView3D(gl.GLViewWidget):
@@ -107,8 +105,6 @@ class VolumeView3D(gl.GLViewWidget):
 
         self._vol: SeisVolume | None = None
         self._s = self._r = self._t = 0
-        self._cmap = "gray"
-        self._clim = (-1.0, 1.0)
         self._counts = (1, 1, 1)        # 各轴的采样点数 (R, S, T)
         self._lens = (1.0, 1.0, 1.0)    # 各轴的显示长度 (R, S, T)
 
@@ -147,8 +143,6 @@ class VolumeView3D(gl.GLViewWidget):
 
         self._add_axis_labels()
         self.reset_view()
-        self.update_faces(vol.ns // 2, vol.nr // 2, vol.nt // 3,
-                          self._cmap, self._clim)
 
     def _disp(self, axis: int, index: int) -> float:
         """把某轴的切片序号映射到显示坐标。"""
@@ -210,27 +204,21 @@ class VolumeView3D(gl.GLViewWidget):
 
     # ------------------------------------------------------------ 刷新
     def update_faces(self, s: int, r: int, t: int,
-                     cmap: str | None = None, clim: tuple[float, float] | None = None,
-                     agc_window: int | None = None) -> None:
-        """刷新三个面的贴图。
+                     faces: dict[str, tuple[np.ndarray, tuple[float, float]]],
+                     cmap: str) -> None:
+        """用主窗口算好的三个面刷新贴图。
 
-        ``agc_window`` 不为 None 时按 AGC 处理竖直面。**关键**：AGC 之后必须
-        重新算这一面的色标。否则会拿"AGC 后数据算出的色标"去画"原始幅度"的
-        贴图 —— 幅度量级差一两个数量级，整个数据体会被冲成一片浅色，只剩极强
-        的同相轴看得见（这正是之前开 AGC 后三维变淡的原因）。
+        ``faces[mode] = (二维显示数组, 色标)``，数组由 ``volume.display_face``
+        产出，与二维剖面**完全相同**（含同一套抽稀、AGC 与色标）。这里只负责
+        摆方向、上色，不再自己算 AGC / 抽稀 / 色标 —— 否则三维与二维会再次分叉。
         """
         if self._vol is None:
             return
-        vol = self._vol
         self._s, self._r, self._t = s, r, t
-        if cmap is not None:
-            self._cmap = cmap
-        if clim is not None:
-            self._clim = clim
 
-        # 共炮点面：局部 x=R、局部 y=T（时间在第 1 轴）；先缩放到显示尺寸，再转到 Y=s 的竖直面
-        shot_img = self._tex(vol.take_face("shot", s), time_axis=1,
-                             agc_window=agc_window, clim=clim)
+        shot_img = render.face_texture(
+            render.face_orientation(faces["shot"][0], "shot"),
+            cmap, faces["shot"][1])
         item = self._faces["shot"]
         item.setData(shot_img)
         item.resetTransform()
@@ -239,9 +227,9 @@ class VolumeView3D(gl.GLViewWidget):
         item.rotate(90, 1, 0, 0)                 # 局部 y → 世界 Z
         item.translate(0, self._disp(1, s), 0)
 
-        # 共检波点面：局部 x=S、局部 y=T；绕 (1,1,1) 转 120° 做循环置换 x→y→z
-        recv_img = self._tex(vol.take_face("recv", r), time_axis=1,
-                             agc_window=agc_window, clim=clim)
+        recv_img = render.face_texture(
+            render.face_orientation(faces["recv"][0], "recv"),
+            cmap, faces["recv"][1])
         item = self._faces["recv"]
         item.setData(recv_img)
         item.resetTransform()
@@ -250,36 +238,15 @@ class VolumeView3D(gl.GLViewWidget):
         item.rotate(120, 1, 1, 1)
         item.translate(self._disp(0, r), 0, 0)
 
-        # 时间切片：局部 x=R、局部 y=S，没有时间轴（AGC 无从下手），
-        # 因此开 AGC 时让它自定色标，免得沿用 AGC 的口径又被冲淡。
-        time_img = self._tex(vol.take_face("time", t), time_axis=None,
-                             agc_window=None,
-                             clim=None if agc_window is not None else clim)
+        time_img = render.face_texture(
+            render.face_orientation(faces["time"][0], "time"),
+            cmap, faces["time"][1])
         item = self._faces["time"]
         item.setData(time_img)
         item.resetTransform()
         item.scale(self._lens[0] / time_img.shape[0],
                    self._lens[1] / time_img.shape[1], 1.0)
         item.translate(0, 0, self._disp_z(t))
-
-    def _tex(self, img: np.ndarray, time_axis: int | None = None,
-             agc_window: int | None = None,
-             clim: tuple[float, float] | None = None) -> np.ndarray:
-        """切片 → （可选 AGC）→ 降采样 → 上色。三维面板只算缩略图。
-
-        ``flip_time`` 由 ``time_axis`` 推出：竖直面的时间轴要倒过来，使 t=0
-        落在贴图上沿（立方体顶部），与剖面、单道波形的"时间向下增大"一致。
-        """
-        if agc_window is not None and time_axis is not None:
-            img = agc(img, agc_window, axis=time_axis)
-        if time_axis is not None:
-            img = img[:, ::-1]
-        if agc_window is not None:
-            clim = compute_clim(img, "robust")   # AGC 之后色标必须重算
-        if clim is None:
-            clim = self._clim
-        small = downscale_for_texture(img, max_side=_TEX_SIDE)
-        return render.face_texture(small, self._cmap, clim)
 
     # ------------------------------------------------------------ 相机
     def _fit_distance(self, azimuth: float, elevation: float,

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import APP_NAME, style
-from .main_window import MainWindow
 
 
 def asset_path(name: str) -> Path | None:
@@ -28,6 +28,44 @@ def asset_path(name: str) -> Path | None:
     return None
 
 
+def _make_splash() -> QtWidgets.QSplashScreen | None:
+    """轻量启动画面：窗口骨架还在构建时先给一个“正在载入”的反馈。
+
+    不做重活、不等后台线程，只是把启动阶段的空白感消掉。
+    """
+    if os.environ.get("SEISVIEW_NO_SPLASH"):
+        return None
+    pm = QtGui.QPixmap(520, 260)
+    pm.fill(QtGui.QColor(style.BG))
+    p = QtGui.QPainter(pm)
+    try:
+        p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        p.setPen(QtGui.QPen(QtGui.QColor(style.LINE_HI), 1))
+        p.drawRect(0, 0, pm.width() - 1, pm.height() - 1)
+        p.setPen(QtGui.QColor(style.TEXT))
+        p.setFont(QtGui.QFont(style.UI_FONT, 30, QtGui.QFont.Weight.DemiBold))
+        p.drawText(pm.rect().adjusted(36, 54, -36, 0),
+                   QtCore.Qt.AlignmentFlag.AlignLeft, APP_NAME)
+        p.setPen(QtGui.QColor(style.ACCENT))
+        p.setFont(QtGui.QFont(style.UI_FONT, 11))
+        p.drawText(pm.rect().adjusted(38, 128, -36, 0),
+                   QtCore.Qt.AlignmentFlag.AlignLeft, "地震数据可视化")
+        p.setPen(QtGui.QColor(style.TEXT_DIM))
+        p.drawText(pm.rect().adjusted(38, 174, -36, 0),
+                   QtCore.Qt.AlignmentFlag.AlignLeft, "正在准备界面…")
+    finally:
+        p.end()
+    splash = QtWidgets.QSplashScreen(pm)
+    splash.setWindowFlag(QtCore.Qt.WindowType.WindowStaysOnTopHint, True)
+    screen = QtGui.QGuiApplication.primaryScreen()
+    if screen is not None:
+        geo = screen.availableGeometry()
+        splash.move(geo.center() - pm.rect().center())
+    splash.show()
+    QtWidgets.QApplication.processEvents()
+    return splash
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv if argv is None else argv)
     # 让所有 OpenGL 上下文共享资源（必须在 QApplication 之前设）。
@@ -44,8 +82,14 @@ def main(argv: list[str] | None = None) -> int:
         app.setWindowIcon(QtGui.QIcon(str(icon)))
     style.apply_theme(app)
 
+    splash = _make_splash()
+    # 主窗口模块（pyqtgraph 等）挪到启动画面之后才 import：这一段耗时
+    # 现在有东西可看，而不是一段纯黑等待。
+    from .main_window import MainWindow
     win = MainWindow()
     win.show()
+    if splash is not None:
+        splash.finish(win)
     # 命令行里给了文件就直接打开
     if len(argv) > 1:
         win.open_path(argv[1])

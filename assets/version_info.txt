@@ -2,14 +2,14 @@
 #
 # exe 的版本资源（Properties → Details 里看到的 FileVersion / ProductVersion）。
 # PyInstaller 通过 seisview.spec 里的 version= 引用本文件 —— 注意它要的是**文件路径**，
-# 直接写 version="0.3.0" 会被当成路径去找文件而报错。
+# 直接写 version="0.3.1" 会被当成路径去找文件而报错。
 #
 # 改版本号时这里要跟 seisview/__init__.py 的 __version__ 一起改（两处必须一致）。
 # 语言写 zh-CN（0x0804 + Unicode 码页 0x04B0），于是文件里的中文说明能正常显示。
 VSVersionInfo(
     ffi=FixedFileInfo(
-        filevers=(0, 3, 0, 0),
-        prodvers=(0, 3, 0, 0),
+        filevers=(0, 3, 1, 0),
+        prodvers=(0, 3, 1, 0),
         mask=0x3F,
         flags=0x0,
         OS=0x40004,
@@ -24,12 +24,12 @@ VSVersionInfo(
                 [
                     StringStruct("CompanyName", "OoBlackFishoO"),
                     StringStruct("FileDescription", "SeisView 地震数据可视化"),
-                    StringStruct("FileVersion", "0.3.0"),
+                    StringStruct("FileVersion", "0.3.1"),
                     StringStruct("InternalName", "SeisView"),
                     StringStruct("LegalCopyright", "MIT License"),
                     StringStruct("OriginalFilename", "SeisView.exe"),
                     StringStruct("ProductName", "SeisView"),
-                    StringStruct("ProductVersion", "0.3.0"),
+                    StringStruct("ProductVersion", "0.3.1"),
                 ],
             )
         ]),

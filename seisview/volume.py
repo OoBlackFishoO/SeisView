@@ -148,12 +148,11 @@ def decimate(arr: np.ndarray, max_cols: int = 2048, max_rows: int = 2048) -> np.
     return np.ascontiguousarray(arr[::step_r, ::step_c])
 
 
-def downscale_for_texture(arr: np.ndarray, max_side: int = 256) -> np.ndarray:
-    """为 3D 面板的贴图降采样：只算 ≤ max_side² 的缩略图，不参与主视图渲染。"""
-    return decimate(arr, max_cols=max_side, max_rows=max_side)
-
-
 # -------------------------------------------------------------------- 增益
+# 滑动 AGC 窗口的下限（再小就只剩几个样点，统计没有意义）
+AGC_MIN_WINDOW = 3
+
+
 def agc(arr: np.ndarray, window: int = 0, axis: int = 0) -> np.ndarray:
     """自动增益控制：沿时间轴做滑动窗口 RMS 归一化。
 
@@ -187,6 +186,34 @@ def agc(arr: np.ndarray, window: int = 0, axis: int = 0) -> np.ndarray:
     if not valid.all():
         out = np.where(valid, out, np.nan).astype(np.float32)
     return np.ascontiguousarray(out.T) if flip else out
+
+
+def display_face(vol: SeisVolume, mode: str, index: int, *,
+                 max_side: int | None = None,
+                 agc_window: int | None = None) -> np.ndarray:
+    """**二维剖面与三维贴图共用的唯一显示数组入口。**
+
+    固定顺序：取片 ``take_slice`` → 抽稀 → AGC（仅 shot/recv）→ 返回。
+    行 = 纵轴、列 = 横轴，与二维面板完全一致；三维贴图只需再转置/翻转。
+
+    ``max_side`` 同时限制行与列（0 / None = 不抽稀）。二维剖面和三维贴图必须
+    传同一个值，否则同一片在同一参数下会得到不同的 AGC 统计口径。
+
+    ``mode == "time"``（时间切片）没有时间轴，AGC 在这里**统一挡掉** ——
+    不再由界面各自判断。滑动窗口必须是非负奇数（0/1 = 整道归一化）。
+    """
+    assert mode in SLICE_MODES, f"未知切片方向：{mode}"
+    if agc_window is not None and agc_window > 1:
+        assert agc_window >= AGC_MIN_WINDOW, \
+            f"AGC 窗口至少 {AGC_MIN_WINDOW} 点，收到 {agc_window}"
+        assert agc_window % 2 == 1, f"AGC 滑动窗口必须是奇数，收到 {agc_window}"
+
+    img = vol.take_slice(mode, index)
+    if max_side:
+        img = decimate(img, max_cols=int(max_side), max_rows=int(max_side))
+    if agc_window is not None and mode != "time":
+        img = agc(img, int(agc_window), axis=0)
+    return img
 
 
 # -------------------------------------------------------------------- 色标
@@ -229,6 +256,25 @@ def compute_clim(arr: np.ndarray, mode: str = "auto", value: float = 1.0,
     if not np.isfinite(v) or v <= 0:
         v = float(np.max(np.abs(sample))) or 1.0
     return (med - v, med + v)
+
+
+def shared_clim(arrays, mode: str = "auto", value: float = 1.0,
+                sigma: float = 8.0) -> tuple[float, float]:
+    """把多份二维显示数组合成**同一个**色标窗口（对比模式用）。
+
+    每张图按 ``size // 50_000`` 抽一次样再拼接，统计口径与
+    :func:`compute_clim` 完全一致；单份数据时结果与直接调用它相同。
+    """
+    parts = []
+    for arr in arrays:
+        a = np.asarray(arr)
+        if a.size == 0:
+            continue
+        step = max(1, a.size // 50_000)
+        parts.append(a.ravel()[::step])
+    if not parts:
+        return (-1.0, 1.0)
+    return compute_clim(np.concatenate(parts), mode, value, sigma)
 
 
 def stats(arr: np.ndarray) -> dict:

@@ -101,11 +101,57 @@ def screen_line_styles(n: int) -> list[tuple[str, str]]:
     return [(colors[i % len(colors)], "solid") for i in range(max(0, n))]
 
 
+class _HoverLabel(QtWidgets.QLabel):
+    """剖面右上角的坐标读数。
+
+    关键约束：**文本变化不能改变布局尺寸**。普通 QLabel 的 sizeHint 会随文字长度
+    增长，在对比模式下会顶宽当前面板、把旁边的剖面挤窄（鼠标指到哪幅、哪幅就变大）。
+    这里把 sizeHint 钉成固定首选宽度、minimumSizeHint 钉成 0，文字过长时自动省略，
+    布局就完全不受悬停内容影响。
+    """
+
+    PREFERRED_WIDTH = 190
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._full = "—"
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight
+                          | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        self.setText("—")
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred,
+                           QtWidgets.QSizePolicy.Policy.Preferred)
+
+    def sizeHint(self) -> QtCore.QSize:                 # noqa: N802
+        return QtCore.QSize(self.PREFERRED_WIDTH,
+                            self.fontMetrics().height() + 2)
+
+    def minimumSizeHint(self) -> QtCore.QSize:          # noqa: N802
+        return QtCore.QSize(0, self.fontMetrics().height() + 2)
+
+    def set_full_text(self, text: str) -> None:
+        self._full = str(text)
+        self.setToolTip(self._full)
+        self._apply_elide()
+
+    def resizeEvent(self, ev) -> None:                  # noqa: N802
+        super().resizeEvent(ev)
+        self._apply_elide()
+
+    def _apply_elide(self) -> None:
+        width = max(0, self.width() - 2)
+        text = self.fontMetrics().elidedText(
+            self._full, QtCore.Qt.TextElideMode.ElideRight, width)
+        if text != self.text():
+            self.setText(text)
+
+
 class SliceView(pg.PlotWidget):
     """一个切片面的显示控件。"""
 
     picked = QtCore.Signal(int, int)            # (列号, 行号)，原始数据网格索引
     hovered = QtCore.Signal(int, int)           # (列号, 行号)，原始数据网格索引
+    hover_left = QtCore.Signal()               # 鼠标离开画面 / 移到复位按钮上
+    doubleClicked = QtCore.Signal()            # 双击复位视野（先发信号、再复位）
 
     def __init__(self, parent=None):
         super().__init__(parent, background=style.GL_BG)
@@ -119,6 +165,16 @@ class SliceView(pg.PlotWidget):
 
         self._img = pg.ImageItem(axisOrder="row-major", autoDownsample=False)
         self.addItem(self._img)
+
+        # 左下角那个 "A" 是 pyqtgraph 自带的自动范围按钮。把它改造成“复位视野”，
+        # 并且下面会阻止它被误判成一次取道（绿线错位的根因）。
+        self._fit_btn = self.getPlotItem().autoBtn
+        try:
+            self._fit_btn.setToolTip("复位视野（回到整幅数据）")
+            self._fit_btn.clicked.disconnect()
+        except (RuntimeError, TypeError):        # pragma: no cover
+            pass
+        self._fit_btn.clicked.connect(self._fit_range)
 
         # 单道波形取自哪一道的提示线：竖线 + 文字标签
         self._wiggles: list[pg.PlotDataItem] = []
@@ -264,22 +320,48 @@ class SliceView(pg.PlotWidget):
         row = int(np.clip(fy * rows, 0, rows - 1))
         return col, row
 
+    def _on_plot_button(self, pos: QtCore.QPointF) -> bool:
+        """控件坐标是否落在 pyqtgraph 的复位按钮上（点按钮不能算取道）。
+
+        **不能要求按钮当前可见**：按钮只在鼠标悬停时才显示，按下那一刻可能还没
+        来得及显示。几何位置始终固定在左下角，按位置判断才可靠。
+        """
+        btn = getattr(self, "_fit_btn", None)
+        if btn is None:
+            return False
+        try:
+            scene_pt = self.mapToScene(pos.toPoint())
+            return btn.contains(btn.mapFromScene(scene_pt))
+        except (RuntimeError, TypeError):        # pragma: no cover
+            return False
+
     def mouseMoveEvent(self, ev) -> None:
         super().mouseMoveEvent(ev)
+        if self._on_plot_button(ev.position()):
+            # 指针停在复位按钮上时没有“剖面坐标”可言，别让右上角读数停在按钮位置
+            self.hover_left.emit()
+            return
         cell = self._to_cell(self.mapToView(ev.position()))
         if cell is not None:
             self.hovered.emit(cell[0], cell[1])
 
     def mousePressEvent(self, ev) -> None:
+        on_btn = self._on_plot_button(ev.position())
+        is_left = ev.button() == QtCore.Qt.MouseButton.LeftButton
         self._press = (ev.position()
-                       if ev.button() == QtCore.Qt.MouseButton.LeftButton and self._shape[0]
+                       if (is_left and self._shape[0] and not on_btn)
                        else None)
+        if on_btn and is_left:
+            # 按钮可能还没因悬停而显示出来；这里主动复位一次，保证“按了就复位”，
+            # 且绝不会被后面的 release 当成取道。
+            self._fit_range()
         super().mousePressEvent(ev)            # 交给 ViewBox 做平移
 
     def mouseReleaseEvent(self, ev) -> None:
         """左键"按下-抬起几乎没动"才算取点。
 
         拖动是平移，若在按下时就取点，每次拖完都会顺手把下方单道波形换掉。
+        按在复位按钮上的那次点击不算 —— 否则复位会顺手把绿线挪到左下角。
         """
         pressed, self._press = self._press, None
         if (pressed is not None
@@ -294,8 +376,13 @@ class SliceView(pg.PlotWidget):
         """双击复位视野（放大看细节之后不用去别处找按钮）。"""
         if ev.button() == QtCore.Qt.MouseButton.LeftButton:
             self._press = None                 # 别让随后的 release 又取一次点
+            self.doubleClicked.emit()          # 主窗口据此撤销第一次 release 的取道
             self._fit_range()
         super().mouseDoubleClickEvent(ev)
+
+    def leaveEvent(self, ev) -> None:          # noqa: N802 （Qt 接口名）
+        super().leaveEvent(ev)
+        self.hover_left.emit()
 
     def set_reference(self, value: float | None, text: str | None = None) -> None:
         """在剖面上标出下方单道波形取自哪一道。
@@ -325,6 +412,7 @@ class SliceView(pg.PlotWidget):
         被它遮蔽；而 ``PlotItem.clear()`` 会把已加入的图元从场景中移除且无法再回来。
         """
         self._shape = (0, 0)
+        self._full = (0, 0)
         self._img.clear()
         self._img.setVisible(True)
         for item in self._wiggles:
@@ -332,6 +420,7 @@ class SliceView(pg.PlotWidget):
         self._wiggles.clear()
         self._line.setVisible(False)
         self._tag.setVisible(False)
+        self.hover_left.emit()
 
 
 # ==================================================================== 剖面对比面板
@@ -374,18 +463,18 @@ class SlicePanel(QtWidgets.QFrame):
         self.title.setObjectName("PanelTitle")
         head.addWidget(self.title)
         head.addStretch(1)
-        self.hover = QtWidgets.QLabel("--")
+        self.hover = _HoverLabel()
         self.hover.setObjectName("Value")
-        self.hover.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight
-                                | QtCore.Qt.AlignmentFlag.AlignVCenter)
         head.addWidget(self.hover)
         lay.addWidget(self.header)
 
         self.view = SliceView()
         self.view.picked.connect(self.picked)
         self.view.hovered.connect(self.hovered)
+        self.view.hover_left.connect(self.reset_hover)
         lay.addWidget(self.view, 1)
         self.set_title("", show=False)
+        self.set_reorder_affordance(False)
 
     def set_title(self, text: str, color: tuple[int, int, int, int] | None = None,
                   show: bool = True,
@@ -403,7 +492,38 @@ class SlicePanel(QtWidgets.QFrame):
             self.swatch.setVisible(True)
 
     def set_hover(self, text: str) -> None:
-        self.hover.setText(text)
+        self.hover.set_full_text(text)
+
+    def reset_hover(self) -> None:
+        """鼠标离开画面：用破折号表示“无坐标”（0 是合法坐标，不能拿来占位）。"""
+        self.hover.set_full_text("—")
+
+    def set_reorder_affordance(self, on: bool) -> None:
+        """对比模式才显示“换序”抓手；单数据时这里不该出现第二个六点。
+
+        抓手换成 ``⇄`` 图标（而不是六点），明确它只负责交换数据顺序，
+        整块移动/拉出统一由上方「剖面」组标题的六点承担。
+        """
+        if getattr(self, "_reorder_on", None) == bool(on):
+            return
+        self._reorder_on = bool(on)
+        self.grab_handle.setVisible(bool(on))
+        if on:
+            self.grab_handle.setPixmap(icons.swap(14, style.TEXT_MUTE))
+            self.grab_handle.setToolTip("拖动 = 交换对比数据顺序")
+            self.header.setToolTip(
+                "拖动这一行 = 交换对比数据的左右顺序。\n"
+                "整块移动 / 拉出独立窗口 / 换分屏方式请拖上方「剖面」标题行。")
+            self.header.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
+        else:
+            self.header.setToolTip("")
+            self.header.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+
+    def reset_view_state(self) -> None:
+        """清空数据时把这一块彻底复位：图、叠加曲线、绿线、标题与坐标读数。"""
+        self.view.reset()
+        self.reset_hover()
+        self.set_title("", show=False)
 
     def restyle(self) -> None:
         """换主题：抓手图标、画布重刷一遍。
@@ -411,7 +531,12 @@ class SlicePanel(QtWidgets.QFrame):
         标题色与线型小图例由主窗口在重画时一并写好（它手里才有"这份数据用哪种颜色"），
         这里不重复设，免得和那份状态打架。
         """
-        self.grab_handle.setPixmap(icons.grab(14, style.TEXT_MUTE))
+        # 单数据时抓手是隐藏的；对比模式下必须保持换序用的 ⇄ 图标，
+        # 不能被换主题统一重刷成六点（否则又出现两套一样的抓手）。
+        if getattr(self, "_reorder_on", False):
+            self.grab_handle.setPixmap(icons.swap(14, style.TEXT_MUTE))
+        else:
+            self.grab_handle.setPixmap(icons.grab(14, style.TEXT_MUTE))
         self.view.restyle()
 
 
@@ -481,7 +606,7 @@ def build_slice_figure(img: np.ndarray, extent: tuple[float, float, float, float
 
     item = pg.ImageItem(axisOrder="row-major", autoDownsample=False)
     # 坏点在白底图上要填成白色，否则会变成一块块暗斑
-    item.setImage(render.to_rgba(img, cmap, clim, missing_rgba=(255, 255, 255, 255)),
+    item.setImage(render.to_rgba(img, cmap, clim, missing_color=(255, 255, 255, 255)),
                   autoLevels=False, levels=None)
     x0, x1, y0, y1 = (float(v) for v in extent)
     item.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))

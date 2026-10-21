@@ -112,10 +112,10 @@ def gradient_strip(name: str, width: int = 128) -> np.ndarray:
 # ==================================================================== 上色
 def to_rgba(arr: np.ndarray, cmap: str, clim: tuple[float, float],
             gamma: float = 1.0,
-            missing_rgba: tuple[int, int, int, int] | None = None) -> np.ndarray:
+            missing_color: tuple[int, int, int, int] | None = None) -> np.ndarray:
     """二维数组 → (h, w, 4) uint8。拖动色标时只重算这一步，数据不动。
 
-    ``missing_rgba`` 是坏点（NaN / Inf）填的颜色，默认面板底色。导出"论文用图"
+    ``missing_color`` 是坏点（NaN / Inf）填的颜色，默认面板底色。导出"论文用图"
     时背景是白的，要把它传成白色，否则坏点会变成一块块暗斑。
     """
     a = np.asarray(arr, dtype=np.float32)
@@ -131,7 +131,7 @@ def to_rgba(arr: np.ndarray, cmap: str, clim: tuple[float, float],
     out = lut(cmap)[idx]
     missing = ~np.isfinite(a)
     if missing.any():
-        out[missing] = missing_rgba() if missing_rgba is None else missing_rgba
+        out[missing] = missing_rgba() if missing_color is None else missing_color
     return out
 
 
@@ -185,6 +185,18 @@ def wiggle_curves(img: np.ndarray, extent: tuple[float, float, float, float],
 
 
 # ==================================================================== 3D 贴图
+def face_orientation(img: np.ndarray, mode: str) -> np.ndarray:
+    """把 ``volume.display_face`` 的二维数组摆成三维贴图的局部方向。
+
+    入参是二维显示方向（行 = 纵轴、列 = 横轴）；返回 (局部 x, 局部 y)：
+      * shot / recv：x = 空间轴、y = 时间轴，且 **t=0 在上**（列翻转）；
+      * time：x = 检波器 R、y = 炮点 S。
+    """
+    if mode == "time":
+        return np.ascontiguousarray(img.T)
+    return np.ascontiguousarray(img.T[:, ::-1])
+
+
 def face_texture(img_xy: np.ndarray, cmap: str, clim: tuple[float, float]) -> np.ndarray:
     """生成 3D 面贴图。
 

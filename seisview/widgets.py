@@ -206,9 +206,14 @@ class SliderRow(QtWidgets.QWidget):
     valueChanged = QtCore.Signal(int)
     released = QtCore.Signal(int)
 
+    # 对数滑杆的内部刻度数：位置 0 → 最小值，POSITIONS → 最大值，中点 = 几何中点
+    LOG_POSITIONS = 1000
+
     def __init__(self, title: str, parent=None, *, spin: bool = False,
-                 suffix: str = ""):
+                 suffix: str = "", log: bool = False):
         super().__init__(parent)
+        self._log = bool(log)
+        self._lo, self._hi = 0, 0
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(3)
@@ -242,7 +247,7 @@ class SliderRow(QtWidgets.QWidget):
         self.slider = WheelSafeSlider(QtCore.Qt.Orientation.Horizontal)
         self.slider.setRange(0, 0)
         self.slider.valueChanged.connect(self._on_change)
-        self.slider.sliderReleased.connect(lambda: self.released.emit(self.slider.value()))
+        self.slider.sliderReleased.connect(lambda: self.released.emit(self.value()))
         row.addWidget(self.slider, 1)
         lay.addLayout(row)
         self._sync_editor(0)
@@ -254,6 +259,24 @@ class SliderRow(QtWidgets.QWidget):
         self.editor.setValue(int(v))
         self.editor.blockSignals(False)
 
+    # ------------------------------------------------------------ 对数映射
+    def _pos_of(self, value: int) -> int:
+        """百分比 → 滑杆位置（对数）。范围非法时退回线性。"""
+        lo, hi = self._lo, self._hi
+        if lo <= 0 or hi <= lo:
+            return int(max(0, min(int(value), self.LOG_POSITIONS)))
+        v = max(lo, min(int(value), hi))
+        frac = math.log(v / lo) / math.log(hi / lo)
+        return int(round(frac * self.LOG_POSITIONS))
+
+    def _value_of(self, pos: int) -> int:
+        """滑杆位置 → 百分比（对数）。"""
+        lo, hi = self._lo, self._hi
+        if lo <= 0 or hi <= lo:
+            return int(pos)
+        frac = max(0.0, min(1.0, pos / self.LOG_POSITIONS))
+        return int(round(lo * (hi / lo) ** frac))
+
     def set_tooltip(self, text: str) -> None:
         """整行设置提示。
 
@@ -264,33 +287,46 @@ class SliderRow(QtWidgets.QWidget):
             if w is not None:
                 w.setToolTip(text)
 
-    def _on_editor(self, v: int) -> None:
-        if self.slider.value() != v:
-            self.slider.blockSignals(True)
-            self.slider.setValue(int(v))
-            self.slider.blockSignals(False)
+    def _show(self, v: int) -> None:
         self.readout.setText(str(int(v)) + self._suffix)
-        self.valueChanged.emit(int(v))
-
-    def _on_change(self, v: int) -> None:
-        self.readout.setText(str(v) + self._suffix)
         self._sync_editor(v)
+
+    def _on_editor(self, v: int) -> None:
+        """数字框：用户敲的是真实百分比，需要反算成滑杆位置。"""
+        v = int(v)
+        pos = self._pos_of(v) if self._log else v
+        if self.slider.value() != pos:
+            self.slider.blockSignals(True)
+            self.slider.setValue(int(pos))
+            self.slider.blockSignals(False)
+        self._show(v)
+        self.valueChanged.emit(v)
+
+    def _on_change(self, raw: int) -> None:
+        v = self._value_of(raw) if self._log else int(raw)
+        self._show(v)
         self.valueChanged.emit(v)
 
     def set_range(self, lo: int, hi: int, value: int | None = None) -> None:
         """设定范围（滑杆与输入框一起）并可选设初值。不主动发信号。"""
         lo, hi = int(lo), max(int(lo), int(hi))
+        current = value if value is not None else self.value()
+        current = max(lo, min(int(current), hi))
+        self._lo, self._hi = lo, hi
         self.slider.blockSignals(True)
-        self.slider.setRange(lo, hi)
-        if value is not None:
-            self.slider.setValue(int(max(lo, min(int(value), hi))))
+        if self._log:
+            self.slider.setRange(0, self.LOG_POSITIONS)
+            self.slider.setValue(self._pos_of(current))
+        else:
+            self.slider.setRange(lo, hi)
+            self.slider.setValue(current)
         self.slider.blockSignals(False)
         if self.editor is not None:
             self.editor.blockSignals(True)
             self.editor.setRange(lo, hi)
-            self.editor.setValue(self.slider.value())
+            self.editor.setValue(current)
             self.editor.blockSignals(False)
-        self.readout.setText(str(self.slider.value()) + self._suffix)
+        self._show(current)
 
     def configure(self, maximum: int, value: int = 0, suffix: str = "") -> None:
         self._suffix = suffix
@@ -299,12 +335,15 @@ class SliderRow(QtWidgets.QWidget):
         self.set_range(0, max(0, maximum), max(0, min(value, max(0, maximum))))
 
     def value(self) -> int:
+        if self._log:
+            return self._value_of(self.slider.value())
         return self.slider.value()
 
     def set_value(self, v: int) -> None:
         """程序化赋值：屏蔽信号，避免与外部状态互相触发。"""
+        pos = self._pos_of(v) if self._log else int(v)
         self.slider.blockSignals(True)
-        self.slider.setValue(int(v))
+        self.slider.setValue(int(pos))
         self.slider.blockSignals(False)
         self._on_change(self.slider.value())
 
@@ -2310,6 +2349,16 @@ class FloatingPanel(QtWidgets.QWidget):
             self.showFullScreen()
         self._sync_full_btn()
         self._place_buttons()
+
+    def keyPressEvent(self, ev) -> None:               # noqa: N802 （Qt 接口名）
+        """Esc：浮窗全屏时先退出全屏，否则收回主窗口。"""
+        if ev.key() == QtCore.Qt.Key.Key_Escape:
+            if self.isFullScreen():
+                self.toggle_fullscreen()
+            else:
+                self.returned.emit(self.panel)
+            return
+        super().keyPressEvent(ev)
 
     def _place_buttons(self) -> None:
         """右上角那两颗悬浮按钮（收回 / 全屏）。

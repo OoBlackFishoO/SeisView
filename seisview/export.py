@@ -53,6 +53,7 @@ offset（可选）          r·dx（取整，按惯例不乘坐标标量）
 from __future__ import annotations
 
 import os
+import threading
 from typing import Callable
 
 import numpy as np
@@ -191,13 +192,48 @@ def _export_matrix(path: str, cube: np.ndarray, fmt: str,
             "超出上限。\n建议导出 .npy（支持流式写入，内存只占一炮）。")
     arr = _materialize(cube, dtype, progress, cancel)
     _tick(cancel)
+    # 写盘库（npz / mat）是单次阻塞调用，库本身不给回调。放到后台线程里写，
+    # 主线程每 50ms 报一次 99% + “正在序列化…”，让界面能继续重绘 ——
+    # 否则进度条会停在 90% 装死。
     if fmt == "npz":
-        np.savez(path, **{NPZ_ARRAY_KEY: arr})
+        _write_serialized(lambda: np.savez(path, **{NPZ_ARRAY_KEY: arr}),
+                          "正在序列化为 NPZ…", progress)
     else:
         import scipy.io
-        scipy.io.savemat(path, {MAT_ARRAY_KEY: arr})
+        _write_serialized(lambda: scipy.io.savemat(path, {MAT_ARRAY_KEY: arr}),
+                          "正在序列化为 MAT…", progress)
     if progress is not None:
         progress(1.0, "完成")
+
+
+def _write_serialized(write: Callable[[], None], text: str,
+                      progress: Progress | None) -> None:
+    """后台线程执行一次阻塞写盘，主线程持续泵进度。
+
+    写盘期间不响应取消（与需求约定一致）：已经进入序列化就让它写完。
+    """
+    done = threading.Event()
+    box: dict[str, BaseException] = {}
+
+    def work() -> None:
+        try:
+            write()
+        except BaseException as exc:          # noqa: BLE001 - 原样回传给主线程
+            box["exc"] = exc
+        finally:
+            done.set()
+
+    if progress is not None:
+        progress(0.99, text)                 # 先把文案与 99% 画出来
+    thread = threading.Thread(target=work, name="seisview-export", daemon=True)
+    thread.start()
+    while not done.wait(0.05):
+        if progress is not None:
+            progress(0.99, text)             # 每次回调里 processEvents，界面继续动
+    thread.join()
+    exc = box.get("exc")
+    if exc is not None:
+        raise exc
 
 
 def _materialize(cube: np.ndarray, dtype: np.dtype,

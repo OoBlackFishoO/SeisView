@@ -35,6 +35,7 @@ import ast
 import hashlib
 import json
 import os
+import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -219,7 +220,7 @@ _seismic_endian: dict[str, str] = {}
 
 # 每读一个道头字段要扫一遍整个文件（按页粒度），所以只读真正必需的两个：
 # FieldRecord 用来分炮、TraceNumber 用来排道。其余字段只从开头几百道取。
-_HEADER_SAMPLE = 512
+_HEADER_SAMPLE = 128       # 估道距/炮距够用；再多只是多几百次道头读取
 _SEGY_HEADER_BYTES = 3600          # 文本头 3200 + 二进制头 400
 _TRACE_HEADER_BYTES = 240
 
@@ -274,32 +275,71 @@ def _median_step(values: np.ndarray) -> float:
     return float(np.median(d)) if d.size else 0.0
 
 
+_FMT_SAMPLE_BYTES = {1: 4, 2: 4, 3: 2, 5: 4, 6: 8, 8: 1}
+
+
+def _fast_seismic_headers(p: Path, n_traces: int, ns: int, fmt_code: int,
+                          head_bytes: int):
+    """用一块 strided 视图一次读全两种道头字段（比逐字段扫两遍快一个量级）。
+
+    SEG-Y/SU 的每条道都是定长 ``[240B 道头][ns 样点]``，所以两种字段都能用
+    同一个步长直接映射。**只在样点数整齐、文件长度对得上时使用**；任何可疑
+    情况都抛异常，由调用方退回 segyio 的逐字段读取。
+    """
+    trace_bytes = _TRACE_HEADER_BYTES + _FMT_SAMPLE_BYTES.get(fmt_code, 4) * ns
+    endian = _seismic_endian.get(str(p), ">")
+    if trace_bytes <= _TRACE_HEADER_BYTES:
+        raise ValueError("非法道长度")
+    if head_bytes + n_traces * trace_bytes > p.stat().st_size:
+        raise ValueError("文件长度与道头推算不一致")
+
+    mm = np.memmap(p, dtype=np.uint8, mode="r")
+    try:
+        def field(off: int, dtype: str, n: int = n_traces):
+            return np.ndarray((n,), dtype=endian + dtype, buffer=mm,
+                              offset=head_bytes + off, strides=(trace_bytes,))
+
+        def one(off: int, dtype: str, trace: int = 0) -> int:
+            return int(np.ndarray(
+                (1,), dtype=endian + dtype, buffer=mm,
+                offset=head_bytes + trace * trace_bytes + off, strides=(0,))[0])
+
+        # 首尾道的采样数必须与 f.samples 一致，否则可能是变长道，不能按固定步长读
+        if one(114, "u2") != ns or one(114, "u2", n_traces - 1) != ns:
+            raise ValueError("道采样数不整齐")
+
+        field_rec = np.array(field(8, "i4"))
+        tracl = np.array(field(12, "i4"), dtype=np.int64)
+        if not np.any(field_rec) or not np.any(tracl):
+            raise ValueError("道头字段不可信")
+
+        n_probe = int(min(_HEADER_SAMPLE, n_traces))
+        sl = slice(0, n_probe)
+        probe_sc = np.array(field(70, "i2")[sl], dtype=np.int64)
+        sx = _scaled_coord(np.array(field(72, "i4")[sl], dtype=np.float64), probe_sc)
+        gx = _scaled_coord(np.array(field(80, "i4")[sl], dtype=np.float64), probe_sc)
+        probe_off = np.array(field(36, "i4")[sl], dtype=np.float64)
+        interval = one(116, "u2")
+    finally:
+        del mm
+    return field_rec, tracl, probe_sc, probe_off, sx, gx, int(interval)
+
+
 def _scan_seismic(p: Path) -> dict:
     """扫一遍道头，建立"炮 → 道"的索引。结果按路径缓存，载入时不再重扫。"""
     hit = _seismic_cache.get(str(p))
     if hit is not None:
         return hit
 
+    t_begin = time.perf_counter()
     segyio = _import_segyio()
     TF = segyio.TraceField
     with _open_seismic(p) as f:
+        t_open = time.perf_counter()
         n_traces = int(f.tracecount)
         ns = int(len(f.samples))
         if n_traces <= 0 or ns <= 0:
             raise LoadError(f"{p.name} 里没有可用的道（道数 {n_traces}、每道采样 {ns}）")
-
-        # 只全扫两个必需字段：FieldRecord 用来分炮、TraceNumber 用来排道。
-        # 每读一个字段 ≈ 把整个文件按页扫一遍，所以不能再多读了。
-        field = np.asarray(f.attributes(TF.FieldRecord)[:])
-        tracl = np.asarray(f.attributes(TF.TraceNumber)[:]).astype(np.int64)
-
-        # 其余道头字段只从开头若干道取，够用来估道距/炮距和报告偏移距范围
-        n_probe = int(min(_HEADER_SAMPLE, n_traces))
-        hdrs = [f.header[i] for i in range(n_probe)]
-        probe_sc = np.array([h[TF.SourceGroupScalar] for h in hdrs], dtype=np.int64)
-        probe_off = np.array([h[TF.offset] for h in hdrs], dtype=np.float64)
-        sx = _scaled_coord([h[TF.SourceX] for h in hdrs], probe_sc)
-        gx = _scaled_coord([h[TF.GroupX] for h in hdrs], probe_sc)
 
         # 采样格式与采样间隔：优先二进制头（Rev1 更可靠），取不到再退回道头
         fmt_code = 5                     # SU 没有二进制头；SU 数据就是本机 float32
@@ -312,8 +352,28 @@ def _scan_seismic(p: Path) -> dict:
             dt_us = int(f.bin[segyio.BinField.Interval])
         except Exception:
             dt_us = 0
-        if dt_us <= 0:
-            dt_us = int(hdrs[0][TF.TRACE_SAMPLE_INTERVAL]) if hdrs else 0
+        head_bytes = 0 if p.suffix.lower() == ".su" else _SEGY_HEADER_BYTES
+        n_probe = int(min(_HEADER_SAMPLE, n_traces))
+
+        # 快路径：一次 strided 映射同时读 FieldRecord / TraceNumber / 探测字段。
+        # 失败（变长道、非常规格式、文件截断）就退回 segyio 的逐字段扫描。
+        try:
+            (field, tracl, probe_sc, probe_off,
+             sx, gx, header_interval) = _fast_seismic_headers(
+                p, n_traces, ns, fmt_code, head_bytes)
+            if dt_us <= 0:
+                dt_us = header_interval
+        except Exception:
+            field = np.asarray(f.attributes(TF.FieldRecord)[:])
+            tracl = np.asarray(f.attributes(TF.TraceNumber)[:]).astype(np.int64)
+            hdrs = [f.header[i] for i in range(n_probe)]
+            probe_sc = np.array([h[TF.SourceGroupScalar] for h in hdrs], dtype=np.int64)
+            probe_off = np.array([h[TF.offset] for h in hdrs], dtype=np.float64)
+            sx = _scaled_coord([h[TF.SourceX] for h in hdrs], probe_sc)
+            gx = _scaled_coord([h[TF.GroupX] for h in hdrs], probe_sc)
+            if dt_us <= 0:
+                dt_us = int(hdrs[0][TF.TRACE_SAMPLE_INTERVAL]) if hdrs else 0
+        t_headers = time.perf_counter()
         dt = (dt_us / 1_000_000.0) if dt_us > 0 else 0.001
 
     # 分炮：FieldRecord 升序；炮内按 TraceNumber 升序
@@ -375,15 +435,28 @@ def _scan_seismic(p: Path) -> dict:
     regular = bool(blocks) and all(
         kind == "range" and tuple(payload) == (k * n_r, (k + 1) * n_r, 0)
         for k, (kind, payload) in enumerate(blocks))
-    fmt_bytes = {1: 4, 2: 4, 3: 2, 5: 4, 6: 8, 8: 1}.get(fmt_code, 4)
     fmt_code_map = {5: "f4", 2: "i4", 3: "i2", 8: "i1"}
-    trace_bytes = _TRACE_HEADER_BYTES + fmt_bytes * ns
-    head_bytes = 0 if p.suffix.lower() == ".su" else _SEGY_HEADER_BYTES
+    trace_bytes = _TRACE_HEADER_BYTES + _FMT_SAMPLE_BYTES.get(fmt_code, 4) * ns
     store_dtype = None
     if regular and fmt_code in fmt_code_map:
         store_dtype = _seismic_endian.get(str(p), ">") + fmt_code_map[fmt_code]
 
     nbytes = int(shots.size) * n_r * ns * np.dtype(store_dtype or "f4").itemsize
+    t_index = time.perf_counter()
+    timing = {
+        "open": t_open - t_begin,
+        "headers": t_headers - t_open,
+        "index": t_index - t_headers,
+        "total": t_index - t_begin,
+        "fallback": not bool(store_dtype),
+        "traces": n_traces,
+    }
+    if os.environ.get("SEISVIEW_PROFILE"):
+        print(
+            f"[SeisView] {p.name}: 打开 {timing['open']:.3f}s / "
+            f"扫道头 {timing['headers']:.3f}s / 建索引 {timing['index']:.3f}s / "
+            f"合计 {timing['total']:.3f}s / 道数 {n_traces} / "
+            f"{'整块读入(fallback)' if timing['fallback'] else '惰性 mmap 视图'}")
     info = {
         "shots": shots, "tracl": tracl, "sx": sx, "gx": gx, "offset": probe_off,
         "n_traces": n_traces, "ns": ns, "dt": dt, "dt_us": dt_us, "fmt_code": fmt_code,
@@ -391,7 +464,7 @@ def _scan_seismic(p: Path) -> dict:
         "counts": counts, "short": short, "holes": holes, "by_tracl": by_tracl,
         "dx": dx, "ds": ds, "dx_ok": dx_ok, "ds_ok": ds_ok, "nbytes": nbytes,
         "trace_bytes": trace_bytes, "first_sample": head_bytes + _TRACE_HEADER_BYTES,
-        "store_dtype": store_dtype, "probed": int(n_probe),
+        "store_dtype": store_dtype, "probed": int(n_probe), "timing": timing,
         "sx_range": (float(np.nanmin(sx)), float(np.nanmax(sx))) if sx.size else (0.0, 0.0),
         "gx_range": (float(np.nanmin(gx)), float(np.nanmax(gx))) if gx.size else (0.0, 0.0),
         "off_range": (float(np.nanmin(probe_off)), float(np.nanmax(probe_off)))
@@ -471,9 +544,15 @@ def _lazy_seismic(p: Path, info: dict):
 
 
 def _load_seismic(p: Path) -> np.ndarray:
+    t0 = time.perf_counter()
     info = _scan_seismic(p)
+    t1 = time.perf_counter()
     lazy = _lazy_seismic(p, info)
+    t2 = time.perf_counter()
     if lazy is not None:
+        if os.environ.get("SEISVIEW_PROFILE"):
+            print(f"[SeisView] {p.name}: 扫道头 {t1 - t0:.3f}s / "
+                  f"建 mmap 视图 {t2 - t1:.3f}s / 合计 {t2 - t0:.3f}s")
         return lazy                                  # 惰性：不预读数据
     if info["nbytes"] > _MAX_CUBE_BYTES:
         raise LoadError(
@@ -491,6 +570,11 @@ def _load_seismic(p: Path) -> np.ndarray:
                 fidx, ridx = payload
                 cube[k, ridx] = np.asarray([f.trace[int(i)] for i in fidx],
                                            dtype=cube.dtype)
+    if os.environ.get("SEISVIEW_PROFILE"):
+        t3 = time.perf_counter()
+        print(f"[SeisView] {p.name}: 扫道头 {t1 - t0:.3f}s / "
+              f"建视图失败 {t2 - t1:.3f}s / 整块读入 {t3 - t2:.3f}s / "
+              f"合计 {t3 - t0:.3f}s（fallback）")
     return cube
 
 

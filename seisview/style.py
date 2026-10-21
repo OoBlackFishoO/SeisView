@@ -95,14 +95,54 @@ _CONTRAST = {
     "SCREEN_LINES": ("#FFD400", "#00E5FF", "#FF5EC8", "#9DFF6B"),
 }
 
+# 玫瑰红：深酒红底 + 粉珊瑚强调色，适合长时间看剖面的暖色主题
+_ROSE = {
+    "label": "玫瑰红",
+    "BG": "#140B10", "PANEL": "#1E1018", "CARD": "#2C1622",
+    "LINE": "#40202E", "LINE_HI": "#65364A",
+    "ACCENT": "#FB7185", "ACCENT_DIM": "#7C2D3E", "ON_ACCENT": "#FFF1F4",
+    "PRIMARY_HOVER": "#B2455A",
+    "OK": "#34D399", "WARN": "#FBBF24", "ERR": "#F87171",
+    "TEXT": "#F7E8EE", "TEXT_DIM": "#C29AA9", "TEXT_MUTE": "#8A6374",
+    "TEXT_OFF": "#4F3240",
+    "BTN_HOVER": "#351A27", "BTN_PRESSED": "#27121D",
+    "DISABLED_BG": "#1A0D14", "DISABLED_BORDER": "#2E1723",
+    "PLAY_BG": "#5B1F31", "PLAY_TEXT": "#FFE4EB", "PLAY_HOVER": "#7A2B43",
+    "TABLE_ALT": "#20121B", "SLIDER_HANDLE": "#FFD6E0",
+    "CAPSULE_BG": "rgba(20, 11, 16, 205)",
+    "GL_BG": "#140B10", "GL_BOX": "#65364A",
+    "SCREEN_LINES": ("#FB7185", "#FBBF24", "#38BDF8", "#A78BFA"),
+}
+
+# 磨砂灰：低反差、低饱和的冷灰层，面板用比底色浅一档的表面色模拟“雾面”
+_FROST = {
+    "label": "磨砂灰（低反差）",
+    "BG": "#141A1F", "PANEL": "#1C232A", "CARD": "#252E36",
+    "LINE": "#323D46", "LINE_HI": "#4E5D68",
+    "ACCENT": "#8BD3E6", "ACCENT_DIM": "#3A6C7A", "ON_ACCENT": "#F2FBFF",
+    "PRIMARY_HOVER": "#57A9BC",
+    "OK": "#5FD3A6", "WARN": "#E8C15A", "ERR": "#F08A8A",
+    "TEXT": "#EAF2F7", "TEXT_DIM": "#A9BBC7", "TEXT_MUTE": "#788B98",
+    "TEXT_OFF": "#4A5A64",
+    "BTN_HOVER": "#2D373F", "BTN_PRESSED": "#232B32",
+    "DISABLED_BG": "#1A2026", "DISABLED_BORDER": "#2A333A",
+    "PLAY_BG": "#1E4A3E", "PLAY_TEXT": "#DFF8EE", "PLAY_HOVER": "#2A6150",
+    "TABLE_ALT": "#202830", "SLIDER_HANDLE": "#DCEBF3",
+    "CAPSULE_BG": "rgba(20, 26, 31, 200)",
+    "GL_BG": "#141A1F", "GL_BOX": "#4E5D68",
+    "SCREEN_LINES": ("#8BD3E6", "#F3D27A", "#F2A7C3", "#B9A7F0"),
+}
+
 THEMES: dict[str, dict] = {
     "deepblue": _DEEPBLUE,
     "midnight": _MIDNIGHT,
     "paper": _PAPER,
     "contrast": _CONTRAST,
+    "rose": _ROSE,
+    "frost": _FROST,
 }
 # 可选主题的顺序（界面里就按这个列）
-THEME_ORDER = ("deepblue", "midnight", "paper", "contrast")
+THEME_ORDER = ("deepblue", "midnight", "paper", "contrast", "rose", "frost")
 # "跟随系统"：浅色系统 → 纸白，深色系统 → 极夜黑
 SYSTEM_KEY = "system"
 _SYSTEM_LIGHT = "paper"

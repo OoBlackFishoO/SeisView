@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import numpy as np
-from scipy.signal import fftconvolve
 
 from .volume import SeisVolume
 
@@ -21,7 +20,12 @@ def _ricker(dt: float, f0: float = 30.0, half_width: float = 0.06) -> np.ndarray
 
 def _add_event(out: np.ndarray, times: np.ndarray, amps: np.ndarray,
                dt: float, wavelet: np.ndarray) -> None:
-    """把一组 (走时, 振幅) 脉冲铺到 out 的每一道上，并与子波卷积。"""
+    """把一组 (走时, 振幅) 脉冲铺到 out 的每一道上，并与子波卷积。
+
+    ``scipy.signal`` 只在真正生成示例数据时才需要 —— 放到函数里 import，
+    软件冷启动就不必为它付一秒多的代价。
+    """
+    from scipy.signal import fftconvolve
     nr, nt = out.shape
     idx = np.clip(times / dt, 0.0, nt - 1.001)
     i0 = np.floor(idx).astype(int)
