@@ -1,0 +1,40 @@
+{
+  "active": 0,
+  "base_clims": 1,
+  "clims": [
+    [
+      -7.364388347578048,
+      7.887673080873489
+    ]
+  ],
+  "content_shown": {
+    "right": false,
+    "slice": true,
+    "trace": true
+  },
+  "datasets": [
+    {
+      "key": "flat",
+      "mode": "shot",
+      "name": "flat",
+      "path": "",
+      "pos": {
+        "recv": 4,
+        "shot": 0,
+        "time": 8
+      },
+      "shape": [
+        1,
+        8,
+        32
+      ]
+    }
+  ],
+  "layout_preset": "B",
+  "pair_order": [
+    "slice",
+    "trace"
+  ],
+  "panels": 1,
+  "user_size": null
+}

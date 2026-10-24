@@ -1,0 +1,60 @@
+{
+  "active": 1,
+  "base_clims": 2,
+  "clims": [
+    [
+      -15.052937072312831,
+      14.985036966001987
+    ],
+    [
+      -15.052937072312831,
+      14.985036966001987
+    ]
+  ],
+  "content_shown": {
+    "right": true,
+    "slice": true,
+    "trace": true
+  },
+  "datasets": [
+    {
+      "key": "a",
+      "mode": "shot",
+      "name": "a",
+      "path": "",
+      "pos": {
+        "recv": 4,
+        "shot": 3,
+        "time": 8
+      },
+      "shape": [
+        6,
+        8,
+        32
+      ]
+    },
+    {
+      "key": "b",
+      "mode": "shot",
+      "name": "b",
+      "path": "",
+      "pos": {
+        "recv": 4,
+        "shot": 3,
+        "time": 8
+      },
+      "shape": [
+        6,
+        8,
+        32
+      ]
+    }
+  ],
+  "layout_preset": "B",
+  "pair_order": [
+    "slice",
+    "right"
+  ],
+  "panels": 2,
+  "user_size": null
+}

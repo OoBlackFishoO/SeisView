@@ -37,6 +37,7 @@ import json
 import os
 import time
 import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,17 +86,28 @@ class LoadError(RuntimeError):
 def _npy_header_meta(fp) -> tuple[str, tuple[int, ...], int]:
     """只读 .npy 文件头，拿到 dtype / shape / 数据区偏移，不碰数据。"""
     magic = fp.read(6)
-    if magic[:6] != _NPY_MAGIC:
-        raise LoadError("不是合法的 .npy 文件头")
-    major = fp.read(1)[0]
-    fp.read(1)  # minor
+    if len(magic) < 6 or magic != _NPY_MAGIC:
+        raise LoadError("不是合法的 .npy 文件头（文件可能被截断）")
+    major_raw = fp.read(1)
+    minor_raw = fp.read(1)
+    if not major_raw or not minor_raw:
+        raise LoadError(".npy 文件头不完整（文件可能被截断）")
+    major = major_raw[0]
     if major == 1:
-        hlen = int.from_bytes(fp.read(2), "little")
+        raw_len = fp.read(2)
+        if len(raw_len) != 2:
+            raise LoadError(".npy 文件头不完整（文件可能被截断）")
+        hlen = int.from_bytes(raw_len, "little")
     else:
-        hlen = int.from_bytes(fp.read(4), "little")
-    raw = fp.read(hlen).decode("latin1")
+        raw_len = fp.read(4)
+        if len(raw_len) != 4:
+            raise LoadError(".npy 文件头不完整（文件可能被截断）")
+        hlen = int.from_bytes(raw_len, "little")
+    raw = fp.read(hlen)
+    if len(raw) != hlen:
+        raise LoadError(".npy 文件头不完整（文件可能被截断）")
     try:
-        hdr = ast.literal_eval(raw.strip())
+        hdr = ast.literal_eval(raw.decode("latin1").strip())
     except (ValueError, SyntaxError) as exc:  # pragma: no cover - 损坏文件
         raise LoadError(f".npy 头解析失败：{exc}") from exc
     descr = str(hdr["descr"])
@@ -115,15 +127,23 @@ def list_variables(path: str | os.PathLike) -> list[VariableInfo]:
     """枚举文件中所有可用的数值变量，尽量不读数据。"""
     p = Path(path)
     suffix = p.suffix.lower()
-    if suffix == ".npy":
-        return _list_npy(p)
-    if suffix == ".npz":
-        return _list_npz(p)
-    if suffix == ".mat":
-        return _list_mat(p)
-    if suffix in SEISMIC_SUFFIXES:
-        return _list_seismic(p)
-    raise LoadError(f"不支持的扩展名：{suffix}（仅支持 .npy / .npz / .mat / .sgy / .segy / .su）")
+    try:
+        if suffix == ".npy":
+            return _list_npy(p)
+        if suffix == ".npz":
+            return _list_npz(p)
+        if suffix == ".mat":
+            return _list_mat(p)
+        if suffix in SEISMIC_SUFFIXES:
+            return _list_seismic(p)
+        raise LoadError(
+            f"不支持的扩展名：{suffix}（仅支持 .npy / .npz / .mat / .sgy / .segy / .su）")
+    except LoadError:
+        raise
+    except Exception as exc:
+        raise LoadError(
+            f"{p.name} 读取失败：文件可能已损坏或不是有效的 {suffix or '数据'} 文件"
+            f"（{type(exc).__name__}）") from exc
 
 
 def _list_npy(p: Path) -> list[VariableInfo]:
@@ -158,7 +178,38 @@ def _list_npz(p: Path) -> list[VariableInfo]:
     return out
 
 
-_mat_cache: dict[str, dict] = {}
+def _lru_get(cache: "OrderedDict", key: str):
+    """读缓存并把它移到最近使用的一端；未命中返回 None。"""
+    try:
+        value = cache[key]
+    except KeyError:
+        return None
+    cache.move_to_end(key)
+    return value
+
+
+def _lru_put(cache: "OrderedDict", sizes: dict, key: str, value, size: int,
+             max_files: int, max_bytes: int) -> None:
+    """写入缓存并按文件数 / 字节数淘汰最久未使用的条目。"""
+    # 外部可能直接对底层 dict 调用过 clear()（已有测试这样做），
+    # 这里先清掉尺寸表里的孤儿项，避免按错误的字节数淘汰。
+    for old_key in [k for k in sizes if k not in cache]:
+        sizes.pop(old_key, None)
+    cache[key] = value
+    sizes[key] = max(0, int(size))
+    cache.move_to_end(key)
+    # 至少保留刚写入的这个文件：单个超大文件的缓存只是复用已有数组，
+    # 不会额外占一份内存；立刻淘汰反而会导致紧接着的 load_array 重读整文件。
+    while (len(cache) > 1
+           and (len(cache) > max_files or sum(sizes.values()) > max_bytes)):
+        old, _ = cache.popitem(last=False)
+        sizes.pop(old, None)
+
+
+_mat_cache: "OrderedDict[str, dict]" = OrderedDict()
+_mat_cache_sizes: dict[str, int] = {}
+_MAT_CACHE_MAX_FILES = 2
+_MAT_CACHE_MAX_BYTES = 1_500_000_000
 
 
 def _list_mat(p: Path) -> list[VariableInfo]:
@@ -185,8 +236,8 @@ def _list_mat(p: Path) -> list[VariableInfo]:
 
 
 def _load_mat_cached(path: str) -> dict:
-    """载入 .mat 并缓存（同一路径只读一次）。"""
-    hit = _mat_cache.get(path)
+    """载入 .mat 并缓存在有上限的 LRU 里（避免整文件被无限期持有）。"""
+    hit = _lru_get(_mat_cache, path)
     if hit is not None:
         return hit
     from scipy.io import loadmat
@@ -196,8 +247,15 @@ def _load_mat_cached(path: str) -> dict:
     except NotImplementedError as exc:
         raise LoadError("这是 MAT v7.3（HDF5）文件，本工具暂不支持，"
                         "请另存为 v7 或导出为 .npz") from exc
+    except Exception as exc:
+        raise LoadError(
+            f"{Path(path).name} 不是可解析的 MAT 文件或已损坏"
+            f"（{type(exc).__name__}）") from exc
     data = {k: v for k, v in raw.items() if not k.startswith("__")}
-    _mat_cache[path] = data
+    size = sum(int(v.nbytes) for v in data.values()
+               if isinstance(v, np.ndarray))
+    _lru_put(_mat_cache, _mat_cache_sizes, path, data, size,
+             _MAT_CACHE_MAX_FILES, _MAT_CACHE_MAX_BYTES)
     return data
 
 
@@ -215,8 +273,11 @@ def _is_numeric_descr(descr: str) -> bool:
 SEISMIC_KEY = "体数据（炮 × 道 × 时间）"
 # 立方体超过这个体积就拒绝，免得直接 OOM
 _MAX_CUBE_BYTES = 6 * 1024 ** 3
-_seismic_cache: dict[str, dict] = {}
+_seismic_cache: "OrderedDict[str, dict]" = OrderedDict()
+_seismic_cache_sizes: dict[str, int] = {}
 _seismic_endian: dict[str, str] = {}
+_SEISMIC_CACHE_MAX_FILES = 4
+_SEISMIC_CACHE_MAX_BYTES = 512 * 1024 ** 2
 
 # 每读一个道头字段要扫一遍整个文件（按页粒度），所以只读真正必需的两个：
 # FieldRecord 用来分炮、TraceNumber 用来排道。其余字段只从开头几百道取。
@@ -325,9 +386,32 @@ def _fast_seismic_headers(p: Path, n_traces: int, ns: int, fmt_code: int,
     return field_rec, tracl, probe_sc, probe_off, sx, gx, int(interval)
 
 
+def _seismic_info_bytes(info: dict) -> int:
+    """估算一条 SEG-Y 索引缓存占用的字节数（只算真正的数组）。"""
+    total = 0
+    for key in ("shots", "tracl", "sx", "gx", "offset"):
+        value = info.get(key)
+        if isinstance(value, np.ndarray):
+            total += int(value.nbytes)
+    for kind, payload in info.get("blocks", ()):
+        if kind == "index":
+            idx, rows = payload
+            total += int(idx.nbytes) + int(rows.nbytes)
+    return total
+
+
+def clear_caches() -> None:
+    """清空 MAT / SEG-Y 的文件缓存（清空数据/移除数据后释放内存）。"""
+    _mat_cache.clear()
+    _mat_cache_sizes.clear()
+    _seismic_cache.clear()
+    _seismic_cache_sizes.clear()
+    _seismic_endian.clear()
+
+
 def _scan_seismic(p: Path) -> dict:
     """扫一遍道头，建立"炮 → 道"的索引。结果按路径缓存，载入时不再重扫。"""
-    hit = _seismic_cache.get(str(p))
+    hit = _lru_get(_seismic_cache, str(p))
     if hit is not None:
         return hit
 
@@ -471,7 +555,9 @@ def _scan_seismic(p: Path) -> dict:
                      if probe_off.size else (0.0, 0.0),
     }
     info["summary"] = _seismic_summary(p, info)
-    _seismic_cache[str(p)] = info
+    _lru_put(_seismic_cache, _seismic_cache_sizes, str(p), info,
+             _seismic_info_bytes(info), _SEISMIC_CACHE_MAX_FILES,
+             _SEISMIC_CACHE_MAX_BYTES)
     return info
 
 
@@ -481,22 +567,8 @@ def _seismic_summary(p: Path, info: dict) -> str:
         f"{info['n_shot']} 炮 × {info['n_r']} 道 × {info['ns']} 采样　"
         f"dt {info['dt'] * 1000:.4g} ms　记录长 {info['ns'] * info['dt']:.3f} s",
     ]
-    if not info["by_tracl"]:
-        lines.append("各炮 TraceNumber 起始号不一致（可能是全文件连续编号），已按顺序紧密排列")
-    if info["holes"]:
-        where = "按道号定位，缺失位置留空" if info["by_tracl"] else "缺道可能造成该炮错位"
-        lines.append(f"{info['holes']} 炮存在缺道（{where}）")
-    if info["short"] and not info["holes"]:
-        lines.append(f"{info['short']} 炮道数少于最多炮（{info['n_r']}），末尾补零")
-    lines.append(
-        f"偏移距 {info['off_range'][0]:.6g} ~ {info['off_range'][1]:.6g}"
-        f"（前 {info['probed']} 道抽样）　"
-        + (f"道距 {info['dx']:.6g} m　炮距 {info['ds']:.6g} m（取自道头）"
-           if info["dx_ok"] and info["ds_ok"] else
-           "道头坐标未能给出可信间距，横轴按道序号/炮序号显示"))
-    if info["store_dtype"]:
-        lines.append("数据按需读取，不会整卷载入内存")
-    lines.append("R 轴 = 炮内道序（非物理检波点坐标）；时间切片是 (炮号, 道号) 索引平面")
+    if info["dx_ok"] and info["ds_ok"]:
+        lines.append(f"道距 {info['dx']:.6g} m　炮距 {info['ds']:.6g} m")
     return "\n".join(lines)
 
 
@@ -597,27 +669,34 @@ def load_array(path: str | os.PathLike, key: str) -> np.ndarray:
     """
     p = Path(path)
     suffix = p.suffix.lower()
-    if suffix in SEISMIC_SUFFIXES:
-        return _load_seismic(p)
-    if suffix == ".npy":
-        arr = np.load(p, mmap_mode="r", allow_pickle=False)
-        if not np.issubdtype(arr.dtype, np.number):
-            raise LoadError(f"{key} 不是数值数组（{arr.dtype}）")
-        return arr
-    if suffix == ".npz":
-        with np.load(p, allow_pickle=False) as z:
-            if key not in z.files:
+    try:
+        if suffix in SEISMIC_SUFFIXES:
+            return _load_seismic(p)
+        if suffix == ".npy":
+            arr = np.load(p, mmap_mode="r", allow_pickle=False)
+            if not np.issubdtype(arr.dtype, np.number):
+                raise LoadError(f"{key} 不是数值数组（{arr.dtype}）")
+            return arr
+        if suffix == ".npz":
+            with np.load(p, allow_pickle=False) as z:
+                if key not in z.files:
+                    raise LoadError(f"{p.name} 中不存在变量 {key}")
+                return z[key]
+        if suffix == ".mat":
+            data = _load_mat_cached(str(p))
+            if key not in data:
                 raise LoadError(f"{p.name} 中不存在变量 {key}")
-            return z[key]
-    if suffix == ".mat":
-        data = _load_mat_cached(str(p))
-        if key not in data:
-            raise LoadError(f"{p.name} 中不存在变量 {key}")
-        arr = data[key]
-        if not isinstance(arr, np.ndarray):
-            raise LoadError(f"{key} 不是矩阵变量（{type(arr).__name__}）")
-        return arr
-    raise LoadError(f"不支持的扩展名：{suffix}")
+            arr = data[key]
+            if not isinstance(arr, np.ndarray):
+                raise LoadError(f"{key} 不是矩阵变量（{type(arr).__name__}）")
+            return arr
+        raise LoadError(f"不支持的扩展名：{suffix}")
+    except LoadError:
+        raise
+    except Exception as exc:
+        raise LoadError(
+            f"{p.name} 读取失败：文件可能已损坏或不是有效的 {suffix or '数据'} 文件"
+            f"（{type(exc).__name__}）") from exc
 
 
 def file_fingerprint(path: str | os.PathLike) -> str:
@@ -708,6 +787,8 @@ def roles_to_order(roles: list[str]) -> tuple[list[int], list[str]]:
 
 def build_volume(name: str, arr: np.ndarray, roles: list[str], **kw) -> SeisVolume:
     """按确认后的轴序把原始数组规范化成 (S, R, T) 的 SeisVolume。"""
+    if arr.ndim == 0 or int(np.min(arr.shape)) <= 0:
+        raise LoadError(f"变量形状 {tuple(arr.shape)} 含 0 长度维度，无法载入")
     if arr.ndim != len(roles):
         raise LoadError(f"轴数不匹配：数据 {arr.ndim} 维，但指定了 {len(roles)} 个轴角色")
     order, _missing = roles_to_order(roles)

@@ -70,6 +70,11 @@ class SeisVolume:
     def is_single_shot(self) -> bool:
         return self.ns == 1
 
+    @property
+    def is_single_trace(self) -> bool:
+        """单道/一维数据：只有一个炮点、一个检波点，沿时间轴一条记录。"""
+        return self.ns == 1 and self.nr == 1
+
     def extent_of(self, mode: str) -> tuple[float, float, float, float]:
         """返回某一面的物理坐标范围 (x0, x1, y0, y1)。
 
@@ -219,17 +224,14 @@ def display_face(vol: SeisVolume, mode: str, index: int, *,
 # -------------------------------------------------------------------- 色标
 def compute_clim(arr: np.ndarray, mode: str = "auto", value: float = 1.0,
                  sigma: float = 8.0) -> tuple[float, float]:
-    """计算色标上下限。
+    """计算色标上下限（对称窗口，中心为中位数）。
 
-    auto   —— 中位数 + sigma×MAD，但用 |x| 的 95% 分位数兜底。
-              MAD 反映数据"安静部分"（噪声底）的宽度，与个别强反射无关，乘一个
-              较大系数就能让噪声底接近色标中性的白色、让同相轴饱和，图像最干净；
-              但它对**重尾分布**失效：实测某真实记录（1024×901）中位数附近的
-              MAD 只有 0.0023，8σ 后上限 0.028，而 5% 的样点幅度已在 0.27 以上——
-              结果 20% 的样点被压成纯红/纯蓝，看上去"对比度爆表"。
-              所以用 P95(|x|) 作为下界：无论数据多"重尾"，最多只截断 5%。
-    robust —— 分位数 2% / 98%
-    manual —— 对称取 ±value
+    auto   —— ``max(8 × 1.4826 × MAD, P99(|x|))``。
+              MAD 反映数据"安静部分"的宽度，对高斯数据给出 8σ 的干净窗口；
+              重尾数据上 8×MAD 会过窄，因此用 P99(|x|) 兜底，默认约 1% 样点饱和。
+    p95/p98/p99 —— 分别取 ``P95/P98/P99(|x|)``；P95 约 5%、P98 约 2%、
+              P99 约 1% 的样点被压成端色。
+    manual —— 对称取 ±value（value 是半宽，不是数据最大幅值）。
 
     NaN / Inf 一律不参与统计：`np.median` 会把中间值本身变成 NaN，一个坏点就能让
     整个窗口失效（整幅图变成一块纯色）。坏点位置交给渲染层单独画成"洞"。
@@ -242,19 +244,20 @@ def compute_clim(arr: np.ndarray, mode: str = "auto", value: float = 1.0,
     sample = sample[np.isfinite(sample)]
     if sample.size == 0:                       # 全是坏点：跟空数据一样兜底
         return (-1.0, 1.0)
-    if mode == "robust":
-        lo, hi = np.percentile(sample, [2.0, 98.0])
-        v = max(abs(float(lo)), abs(float(hi)), 1e-30)
-        return (-v, v)
     med = float(np.median(sample))
-    mad = float(np.median(np.abs(sample - med)))
-    v = 1.4826 * mad * sigma
-    floor = float(np.percentile(np.abs(sample), 95.0))
+    abs_sample = np.abs(sample)
+    if mode in ("p95", "p98", "p99"):
+        q = {"p95": 95.0, "p98": 98.0, "p99": 99.0}[mode]
+        v = float(np.percentile(abs_sample, q))
+    else:
+        mad = float(np.median(np.abs(sample - med)))
+        v = 1.4826 * mad * sigma
+        floor = float(np.percentile(abs_sample, 99.0))
+        if not np.isfinite(v) or v <= 0:
+            v = floor
+        v = max(v, floor)
     if not np.isfinite(v) or v <= 0:
-        v = floor
-    v = max(v, floor)
-    if not np.isfinite(v) or v <= 0:
-        v = float(np.max(np.abs(sample))) or 1.0
+        v = float(np.max(abs_sample)) or 1.0
     return (med - v, med + v)
 
 

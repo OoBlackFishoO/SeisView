@@ -13,12 +13,17 @@
 import os
 
 from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.building.splash import Splash
 
 HERE = os.path.abspath(os.getcwd())
 
 ICON = os.path.join("assets", "seisview.ico")
 
-# exe 的版本资源：PyInstaller 的 version= 要的是**文件路径**（写成 "0.3.1" 会被当成路径去
+# bootloader 启动画面：双击 exe 后、Python 与 PySide6 还没加载完就先把这张图显示出来，
+# 补上“进程已启动但主界面还没出现”的空窗期。图片里的文字是静态的。
+SPLASH_IMG = os.path.join("assets", "splash.png")
+
+# exe 的版本资源：PyInstaller 的 version= 要的是**文件路径**（写成 "0.4.0" 会被当成路径去
 # 找文件而报错）。资源内容见 assets/version_info.txt —— 里面的版本号要与
 # seisview/__init__.py 的 __version__ 保持一致。
 VERSION_TXT = os.path.join("assets", "version_info.txt")
@@ -36,7 +41,7 @@ EXCLUDES = [
     "PySide6.QtBluetooth", "PySide6.QtNfc", "PySide6.QtDesigner",
     "PySide6.QtTest", "PySide6.QtSql", "PySide6.QtSerialPort",
     "PySide6.QtPositioning", "PySide6.QtLocation", "PySide6.QtSensors",
-    "tkinter", "matplotlib", "IPython", "pytest", "PyQt5", "PyQt6",
+    "matplotlib", "IPython", "pytest", "PyQt5", "PyQt6",
     # 实测坑：_pyinstaller_hooks_contrib 里的 hook-pyqtgraph 会顺着
     # PyInstaller 的模块图把 torch 一路分析进来，凭空多出 3.5 GB 的 CUDA 运行库
     # （torch_cuda.dll 885 MB、cudnn 561 MB…）。本程序完全不碰这些，必须显式排掉。
@@ -44,7 +49,7 @@ EXCLUDES = [
     "tensorboard", "tensorflow", "keras", "sklearn", "pandas",
     "numba", "llvmlite", "cv2", "h5py", "sympy", "psutil",
     "jupyter", "jupyter_rfb", "jupyter_client", "notebook", "nbformat",
-    "nbconvert", "ipykernel", "pyqtgraph.jupyter", "pyqtgraph.exporters",
+    "nbconvert", "ipykernel", "pyqtgraph.jupyter",
 ]
 
 # PyOpenGL 和 pyqtgraph 都会在运行时动态 import 子模块，静态分析扫不到，
@@ -52,6 +57,7 @@ EXCLUDES = [
 HIDDEN = [
     "scipy.io",                 # .mat 读取
     "segyio", "segyio._segyio",  # SEG-Y / SU 读取
+    "pyqtgraph.exporters",      # 论文用图导出（PNG / SVG）动态导入
     *collect_submodules("OpenGL"),
     "pyqtgraph.opengl",
 ]
@@ -60,7 +66,8 @@ a = Analysis(
     ["main.py"],
     pathex=[HERE],
     binaries=[],
-    datas=[(ICON, "assets"), (os.path.join("assets", "seisview.png"), "assets")],
+    datas=[(ICON, "assets"), (os.path.join("assets", "seisview.png"), "assets"),
+           (SPLASH_IMG, "assets")],
     hiddenimports=HIDDEN,
     hookspath=[],
     hooksconfig={},
@@ -71,10 +78,20 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# 启动画面必须在 EXE 之前建好；它的 tk 资源要同时进 EXE 与 COLLECT。
+splash = Splash(
+    SPLASH_IMG,
+    binaries=a.binaries,
+    datas=a.datas,
+    always_on_top=True,
+    center="default",
+)
+
 exe = EXE(
     pyz,
     a.scripts,
-    [],
+    splash,
+    splash.binaries,
     exclude_binaries=True,
     name="SeisView",
     debug=False,
@@ -91,6 +108,7 @@ coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
+    splash.binaries,
     strip=False,
     upx=False,
     name="SeisView",

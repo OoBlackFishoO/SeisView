@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("SEISVIEW_NO_PERSIST", "1")
@@ -175,6 +177,18 @@ class GuiRegressionTest(unittest.TestCase):
         self.assertEqual((self.win.width(), self.win.height()), (width, height))
         self.assertEqual(self.win.slice_split.sizes(), sizes)
 
+    def test_reset_button_equalizes_compare_panels(self):
+        """对比模式下拖动改变各剖面宽度后，刷新键应把它们恢复成等宽。"""
+        QtTest.QTest.qWait(200)               # 等载入后的面板重建落定
+        sp = self.win.slice_split
+        self.assertGreaterEqual(sp.count(), 2)
+        sp.setSizes([500] + [10] * (sp.count() - 1))
+        QtTest.QTest.qWait(30)
+        self.assertGreater(max(sp.sizes()) - min(sp.sizes()), 10)
+        self.win.reset_panel_layout()
+        QtTest.QTest.qWait(80)
+        self.assertLessEqual(max(sp.sizes()) - min(sp.sizes()), 2)
+
     # ---------------------------------------------------------------- B3
     def test_sidebar_collapse_keeps_workspace_size(self):
         # 窗口要足够宽，收起侧边栏后总宽度仍高于最小尺寸，才能验证“工作区像素不变”
@@ -257,6 +271,128 @@ class GuiRegressionTest(unittest.TestCase):
         self.win._refresh_all()
         QtTest.QTest.qWait(40)
         self.assertFalse(self.win.panels[0].grab_handle.isVisible())
+
+    # ---------------------------------------------------------------- A6 / 导出
+    def test_slice_export_uses_current_clim_settings(self):
+        """导出剖面 PNG 必须复用屏幕当前的手动半宽 / 对比度窗口。"""
+        self.win.chk_pure.setChecked(False)
+        self.win.clim_combo.setCurrentIndex(
+            self.win.clim_combo.findData("manual"))
+        self.win.spin_manual.setValue(2.5)
+        self.win.contrast.set_value(200)
+        QtTest.QTest.qWait(30)
+
+        expected = self.win._scale_window(self.win._shared_base_clim())
+        self.assertEqual(expected, (-1.25, 1.25))
+        # 屏幕、全分辨率数组、真正传给绘图函数的三者必须是同一个窗口
+        np.testing.assert_allclose(self.win._panel_image(0)[1], expected)
+        np.testing.assert_allclose(self.win._panel_image(0, full=True)[1], expected)
+
+        captured = {}
+
+        class _Plot:
+            def close(self):
+                pass
+
+        def fake_build(img, extent, cmap, clim, *args, **kwargs):
+            captured["clim"] = clim
+            return _Plot()
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+
+        class _Dlg:
+            def content(self):
+                return "slice_image"
+
+            def dataset_scope(self):
+                return "active"
+
+            def path(self):
+                return str(Path(tmp.name) / "slice.png")
+
+            def fmt(self):
+                return "png"
+
+        orig_build = mw.view2d.build_slice_figure
+        orig_export = mw.view2d.export_figure
+        mw.view2d.build_slice_figure = fake_build
+        mw.view2d.export_figure = lambda *a, **kw: None
+        try:
+            made = self.win._export_slice_figures(_Dlg(), lambda *_: None)
+        finally:
+            mw.view2d.build_slice_figure = orig_build
+            mw.view2d.export_figure = orig_export
+
+        self.assertEqual(len(made), 1)
+        np.testing.assert_allclose(captured["clim"], expected)
+
+    def test_contrast_refresh_is_coalesced_and_reuses_raw_cache(self):
+        """拖动对比度只重做上色：不重算切片，也不逐格全量刷新。"""
+        raw_key = (0, False)
+        raw_before = self.win._raw_cache[raw_key][0]
+        base_before = self.win._shared_base_clim()
+        calls = []
+        orig_refresh = self.win._refresh_panel
+
+        def spy(k):
+            calls.append(k)
+            return orig_refresh(k)
+
+        self.win._refresh_panel = spy
+        try:
+            self.win.contrast.set_value(200)
+            self.assertEqual(calls, [])          # 定时器未到，先不重绘
+            QtTest.QTest.qWait(60)
+        finally:
+            del self.win._refresh_panel
+        self.assertGreaterEqual(len(calls), 1)
+        # 切片数组与基准窗口都没有被重算
+        self.assertIs(self.win._raw_cache[raw_key][0], raw_before)
+        self.assertIs(self.win._shared_base_clim(), base_before)
+        expected = self.win._scale_window(base_before)
+        np.testing.assert_allclose(self.win._panel_image(0)[1], expected)
+
+    def test_manual_scope_autofills_p98_once(self):
+        """首次切到手动时自动填入 P98 推荐值，之后不覆盖用户改过的值。"""
+        self.win.clim_combo.setCurrentIndex(
+            self.win.clim_combo.findData("manual"))
+        QtTest.QTest.qWait(20)
+        sample = np.concatenate(
+            [self.win._base_sample(k) for k in range(len(self.win.datasets))])
+        want = float(np.percentile(np.abs(sample), 98.0))
+        self.assertAlmostEqual(self.win.spin_manual.value(), want, places=6)
+        lo, hi = self.win._shared_base_clim()
+        self.assertAlmostEqual(0.5 * (hi - lo), want, places=6)
+
+        self.win.spin_manual.setValue(want / 2.0)
+        self.win.clim_combo.setCurrentIndex(
+            self.win.clim_combo.findData("auto"))
+        self.win.clim_combo.setCurrentIndex(
+            self.win.clim_combo.findData("manual"))
+        QtTest.QTest.qWait(20)
+        self.assertAlmostEqual(self.win.spin_manual.value(), want / 2.0, places=6)
+
+    def test_first_load_does_not_animate_window(self):
+        """首次载入直接落到最终尺寸，避免空窗口 → 有数据的中间帧闪烁。"""
+        self.win.clear_data()
+        QtTest.QTest.qWait(350)
+        self.assertFalse(self.win.datasets)
+        called = []
+        orig = self.win._animate_layout_change
+
+        def spy(*a, **kw):
+            called.append(1)
+            return orig(*a, **kw)
+
+        self.win._animate_layout_change = spy
+        try:
+            self.win._install_primary(_volume(2.0, seed=9), "", "first")
+        finally:
+            del self.win._animate_layout_change
+        self.assertEqual(called, [])
+        self.assertTrue(self.win.updatesEnabled())
+        self.assertIsNotNone(self.win.panels[0].view._img.image)
 
     def test_restore_maximized_returns_to_previous_size(self):
         self.win.resize(1000, 700)

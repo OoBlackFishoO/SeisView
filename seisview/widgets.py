@@ -12,7 +12,10 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import export as exporter
-from . import icons, render, style
+from . import icons, render, style, view2d
+from .figure_options import (DEFAULT_LINE_STYLES, FIGURE_TEXT, FONT_FAMILIES,
+                             LINE_COLORS, LINE_STYLES, ExportFigureOptions,
+                             figure_labels)
 from .loaders import VariableInfo, guess_roles, role_options
 from .volume import ROLE_LABELS, ROLE_RECV, ROLE_SHOT, ROLE_TIME
 
@@ -502,21 +505,23 @@ class VariableTable(QtWidgets.QTableWidget):
         for r, info in enumerate(infos):
             # 表格列宽紧张，形状用紧凑写法（×两侧不留空格），完整信息放在提示里
             shape = "×".join(str(v) for v in info.shape) or "标量"
-            size = info.size_text + (f" · {info.note}" if info.note else "")
-            cells = (info.key, shape, info.dtype, size)
+            cells = (info.key, shape, info.dtype, info.size_text)
             for c, text in enumerate(cells):
                 item = QtWidgets.QTableWidgetItem(text)
                 if c >= 1:
                     item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
                 item.setToolTip(f"{info.key}\n形状 {' × '.join(str(v) for v in info.shape) or '标量'}"
-                                f"\n类型 {info.dtype}\n大小 {info.size_text}"
-                                + (f"\n读取方式 {info.note}" if info.note else ""))
+                                f"\n类型 {info.dtype}\n大小 {info.size_text}")
                 self.setItem(r, c, item)
         if infos:
             self.selectRow(0)
 
     def keys(self) -> list[str]:
         return [i.key for i in self._infos]
+
+    def infos(self) -> list[VariableInfo]:
+        """当前变量清单快照（导出/导入失败时恢复来源面板用）。"""
+        return list(self._infos)
 
     def info_of(self, row: int) -> VariableInfo | None:
         return self._infos[row] if 0 <= row < len(self._infos) else None
@@ -568,10 +573,7 @@ class AxisOrderDialog(QtWidgets.QDialog):
         title.setObjectName("Title")
         root.addWidget(title)
 
-        hint = QtWidgets.QLabel(
-            f"数据形状：{' × '.join(str(v) for v in shape)}\n"
-            "轴序没有通用约定（MATLAB 常为 时间×道，Python 常为 道×时间），\n"
-            "请核对每一维的物理含义。长度通常能帮你判断哪一维是时间。")
+        hint = QtWidgets.QLabel(f"数据形状：{' × '.join(str(v) for v in shape)}")
         hint.setObjectName("Hint")
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -729,9 +731,7 @@ class ArrayViewDialog(QtWidgets.QDialog):
 
         n = self._values.size
         if n > self.MAX_ROWS:
-            note = QtWidgets.QLabel(
-                f"数值较多，表格只显示前 {self.MAX_ROWS} 个；"
-                "「复制全部」会复制完整内容。")
+            note = QtWidgets.QLabel(f"仅显示前 {self.MAX_ROWS} 个数值")
             note.setObjectName("Hint")
             note.setWordWrap(True)
             root.addWidget(note)
@@ -816,7 +816,183 @@ class ArrayViewDialog(QtWidgets.QDialog):
         self.status.setText(f"已复制 {len(lines)} 个数值到剪贴板")
 
 
+# ==================================================================== 导出线型
+class LineStyleEditor(QtWidgets.QWidget):
+    """导出用波形线型：按数据顺序选颜色与线型（只影响 PNG / SVG）。"""
+
+    def __init__(self, count: int = 1, styles=None, parent=None):
+        super().__init__(parent)
+        self._rows: list[tuple[QtWidgets.QWidget, "WheelSafeComboBox",
+                               "WheelSafeComboBox", QtWidgets.QLabel]] = []
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(5)
+        for i in range(3):
+            holder = QtWidgets.QWidget()
+            row = QtWidgets.QHBoxLayout(holder)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(6)
+            lab = QtWidgets.QLabel(f"数据 {i + 1}")
+            lab.setObjectName("Hint")
+            lab.setFixedWidth(44)
+            combo_color = WheelSafeComboBox()
+            for name, hexv in LINE_COLORS:
+                combo_color.addItem(name, hexv)
+            combo_style = WheelSafeComboBox()
+            for name, key in LINE_STYLES:
+                combo_style.addItem(name, key)
+            swatch = QtWidgets.QLabel()
+            swatch.setFixedSize(26, 12)
+            combo_color.currentIndexChanged.connect(self._on_change)
+            combo_style.currentIndexChanged.connect(self._on_change)
+            row.addWidget(lab)
+            row.addWidget(combo_color, 1)
+            row.addWidget(combo_style, 1)
+            row.addWidget(swatch)
+            lay.addWidget(holder)
+            self._rows.append((holder, combo_color, combo_style, swatch))
+        btn_reset = QtWidgets.QPushButton("恢复默认线型")
+        btn_reset.setObjectName("Ghost")
+        btn_reset.clicked.connect(self.reset)
+        lay.addWidget(btn_reset)
+        self.set_styles(styles, count)
+
+    def set_styles(self, styles, count: int | None = None) -> None:
+        styles = list(styles or DEFAULT_LINE_STYLES)
+        n = max(1, len(styles))
+        for i, (_holder, combo_color, combo_style, _swatch) in enumerate(self._rows):
+            color, dash = styles[i % n]
+            combo_color.blockSignals(True)
+            combo_style.blockSignals(True)
+            combo_color.setCurrentIndex(max(0, combo_color.findData(color)))
+            combo_style.setCurrentIndex(max(0, combo_style.findData(dash)))
+            combo_color.blockSignals(False)
+            combo_style.blockSignals(False)
+        if count is not None:
+            self.set_count(count)
+        self._refresh_swatches()
+
+    def set_count(self, count: int) -> None:
+        for i, (holder, *_rest) in enumerate(self._rows):
+            holder.setEnabled(i < max(1, int(count)))
+
+    def _refresh_swatches(self) -> None:
+        for i, (_holder, combo_color, combo_style, swatch) in enumerate(self._rows):
+            pair = (combo_color.currentData() or "#111827",
+                    combo_style.currentData() or "solid")
+            swatch.setPixmap(view2d.line_swatch_pixmap(pair, 26, 12))
+
+    def _on_change(self, _index: int) -> None:
+        self._refresh_swatches()
+
+    def reset(self) -> None:
+        self.set_styles(DEFAULT_LINE_STYLES)
+
+    def line_styles(self) -> list[tuple[str, str]]:
+        out = []
+        for _holder, combo_color, combo_style, _swatch in self._rows:
+            out.append((combo_color.currentData() or "#111827",
+                        combo_style.currentData() or "solid"))
+        return out
+
+
+class _ZoomView(QtWidgets.QGraphicsView):
+    """预览画布：滚轮缩放、拖拽平移、双击适应窗口。"""
+
+    def __init__(self, pixmap: QtGui.QPixmap, parent=None):
+        super().__init__(parent)
+        self._scene = QtWidgets.QGraphicsScene(self)
+        self._item = self._scene.addPixmap(pixmap)
+        self.setScene(self._scene)
+        self.setDragMode(QtWidgets.QGraphicsView.DragMode.ScrollHandDrag)
+        self.setTransformationAnchor(
+            QtWidgets.QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setRenderHints(QtGui.QPainter.RenderHint.SmoothPixmapTransform)
+        self.setBackgroundBrush(QtGui.QColor(style.GL_BG))
+        self.fit()
+
+    def fit(self) -> None:
+        self.fitInView(self._item, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+
+    def actual_size(self) -> None:
+        self.resetTransform()
+
+    def zoom(self, factor: float) -> None:
+        self.scale(factor, factor)
+
+    def wheelEvent(self, ev) -> None:               # noqa: N802 （Qt 接口名）
+        self.zoom(1.25 if ev.angleDelta().y() > 0 else 0.8)
+        ev.accept()
+
+    def mouseDoubleClickEvent(self, ev) -> None:    # noqa: N802 （Qt 接口名）
+        self.fit()
+        ev.accept()
+
+    def showEvent(self, ev) -> None:                # noqa: N802 （Qt 接口名）
+        super().showEvent(ev)
+        self.fit()
+
+
+class FigurePreviewDialog(QtWidgets.QDialog):
+    """导出预览：按最终像素尺寸渲染，可缩放/拖拽查看细节。"""
+
+    def __init__(self, image: QtGui.QImage, info: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("导出预览")
+        self.setModal(True)
+        self.resize(980, 800)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+        pix = QtGui.QPixmap.fromImage(image)
+        self.view = _ZoomView(pix, self)
+        lay.addWidget(self.view, 1)
+
+        tools = QtWidgets.QHBoxLayout()
+        tools.setContentsMargins(0, 0, 0, 0)
+        tools.setSpacing(6)
+        for text, slot in (("适应窗口", self.view.fit),
+                           ("1:1", self.view.actual_size),
+                           ("放大", lambda: self.view.zoom(1.25)),
+                           ("缩小", lambda: self.view.zoom(0.8))):
+            btn = QtWidgets.QPushButton(text)
+            btn.setObjectName("Ghost")
+            btn.clicked.connect(slot)
+            tools.addWidget(btn)
+        tools.addSpacing(8)
+        hint = QtWidgets.QLabel(info)
+        hint.setObjectName("Hint")
+        hint.setWordWrap(True)
+        tools.addWidget(hint, 1)
+        lay.addLayout(tools)
+
+        foot = QtWidgets.QHBoxLayout()
+        foot.addStretch(1)
+        btn = QtWidgets.QPushButton("关闭")
+        btn.setObjectName("Primary")
+        btn.clicked.connect(self.accept)
+        foot.addWidget(btn)
+        lay.addLayout(foot)
+
+
 # ==================================================================== 导出对话框
+def _nice_tick(span: float) -> float:
+    """按轴跨度取一个「整齐」的主刻度间隔，约 10 格铺满整条轴。"""
+    try:
+        span = abs(float(span))
+    except (TypeError, ValueError):              # pragma: no cover
+        return 0.0
+    if not math.isfinite(span) or span <= 0:
+        return 0.0
+    raw = span / 10.0
+    mag = 10 ** math.floor(math.log10(raw))
+    for mult in (1, 2, 5, 10):
+        step = mult * mag
+        if step >= raw:
+            return float(min(1_000_000.0, step))
+    return float(min(1_000_000.0, 10 * mag))
+
+
 class ExportDialog(QtWidgets.QDialog):
     """导出 / 转换：一个对话框里按「导出内容」分层组织四种动作。
 
@@ -827,7 +1003,9 @@ class ExportDialog(QtWidgets.QDialog):
     * **逐剖面** —— 沿一个方向切开，每片一个文件；**可选片层范围**（起点 / 终点），
       还能一键切到「只导出当前显示的剖面」；对比模式下可一次导出全部数据源；
     * **剖面图** —— 把当前剖面**重画**成一张论文用图（白底、坐标轴按 dt/dx/ds 标出
-      秒 / 米、带色条），PNG 或 SVG；
+      秒 / 米、带色条），PNG 或 SVG；永远是密度图，不受屏幕"仅显示波形"影响；
+    * **wiggle 剖面** —— 设置同剖面图，但只画波形曲线（不带密度图与色条）；
+      对比模式下所有数据源叠加成一张图，线型单独设置；
     * **波形图** —— 同理，把当前单道波形重画成论文用图。
 
     入口只保留这一个（顶栏按钮 / Ctrl+E）：自定义导出、部分片层、剖面/波形图片导出
@@ -835,7 +1013,8 @@ class ExportDialog(QtWidgets.QDialog):
     """
 
     CONTENT_MODES = [("整卷数据", "volume"), ("逐剖面", "slices"),
-                     ("剖面图", "slice_image"), ("波形图", "wave_image")]
+                     ("剖面图", "slice_image"), ("wiggle 剖面", "wiggle_image"),
+                     ("波形图", "wave_image")]
     FORMATS = {
         "volume": [("NumPy 单文件 (.npy)", "npy"), ("NumPy 容器 (.npz)", "npz"),
                    ("MATLAB (.mat)", "mat"), ("SEG-Y (.sgy)", "sgy"),
@@ -843,23 +1022,36 @@ class ExportDialog(QtWidgets.QDialog):
         "slices": [("NumPy 单文件 (.npy)", "npy"), ("NumPy 容器 (.npz)", "npz"),
                    ("MATLAB (.mat)", "mat")],
         "slice_image": [("PNG 位图 (.png)", "png"), ("SVG 矢量 (.svg)", "svg")],
+        "wiggle_image": [("PNG 位图 (.png)", "png"), ("SVG 矢量 (.svg)", "svg")],
         "wave_image": [("PNG 位图 (.png)", "png"), ("SVG 矢量 (.svg)", "svg")],
     }
-    IMAGE_MODES = ("slice_image", "wave_image")
+    IMAGE_MODES = ("slice_image", "wiggle_image", "wave_image")
     SUFFIX = {"npy": ".npy", "npz": ".npz", "mat": ".mat", "sgy": ".sgy",
               "su": ".su", "png": ".png", "svg": ".svg"}
 
-    def __init__(self, entries, active: int, default_dir, default_stem: str, parent=None):
+    previewRequested = QtCore.Signal()
+
+    def __init__(self, entries, active: int, default_dir, default_stem: str,
+                 line_styles=None, mode: str = "shot",
+                 source_path: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("导出 / 转换")
         self.setModal(True)
-        self.setMinimumWidth(560)
+        self.setMinimumWidth(640)
         # entries: [{"label", "vol", "pos"}] —— 已载入的数据集（含各自的当前切片位置）
         self._entries = list(entries)
         self._active = max(0, min(int(active), len(self._entries) - 1))
         self._vol = self._entries[self._active]["vol"]
         self._dir = str(default_dir)
         self._stem = default_stem
+        self._export_stem = (default_stem if default_stem.endswith("_export")
+                             else f"{default_stem}_export")
+        self._source_path = str(source_path or "")
+        self._line_styles = list(line_styles or DEFAULT_LINE_STYLES)
+        self._mode = mode                # 当前剖面方向：决定自动轴标题
+        self._auto_axes = ("", "")       # 上一次自动生成的 (横轴, 纵轴)
+        self._tick_edited = {"x": False, "y": False}
+        self._tick_state = None
         self._fitted = False                        # 首次弹出时统一一次尺寸
 
         root = QtWidgets.QVBoxLayout(self)
@@ -878,6 +1070,20 @@ class ExportDialog(QtWidgets.QDialog):
         self.content_ctl.changed.connect(self._on_content)
         root.addWidget(self.content_ctl)
 
+        # ---- 设置区：内容较长时只让中间滚动，标题 / 内容类型 / 底部按钮固定
+        self.body = QtWidgets.QWidget()
+        self.body_lay = QtWidgets.QVBoxLayout(self.body)
+        self.body_lay.setContentsMargins(0, 0, 0, 0)
+        self.body_lay.setSpacing(10)
+        self.scroll = QtWidgets.QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setMinimumHeight(0)
+        self.scroll.setWidget(self.body)
+        root.addWidget(self.scroll, 1)
+
         # ---- 数据源（只有对比模式、且内容不是整卷时才出现）
         self.scope_row = QtWidgets.QWidget()
         srow = QtWidgets.QHBoxLayout(self.scope_row)
@@ -891,7 +1097,7 @@ class ExportDialog(QtWidgets.QDialog):
         self.combo_scope.currentIndexChanged.connect(lambda _i: self._refresh_texts())
         srow.addWidget(slab)
         srow.addWidget(self.combo_scope, 1)
-        root.addWidget(self.scope_row)
+        self.body_lay.addWidget(self.scope_row)
 
         # ---- 格式
         row = QtWidgets.QHBoxLayout()
@@ -903,7 +1109,7 @@ class ExportDialog(QtWidgets.QDialog):
         self.combo_fmt.currentIndexChanged.connect(self._on_format)
         row.addWidget(self.lab_fmt)
         row.addWidget(self.combo_fmt, 1)
-        root.addLayout(row)
+        self.body_lay.addLayout(row)
 
         # ---- 路径
         row = QtWidgets.QHBoxLayout()
@@ -919,18 +1125,13 @@ class ExportDialog(QtWidgets.QDialog):
         row.addWidget(self.lab_path)
         row.addWidget(self.path_edit, 1)
         row.addWidget(btn_browse)
-        root.addLayout(row)
+        self.body_lay.addLayout(row)
 
         # ---- 规模 / 提示
         self.scale_label = QtWidgets.QLabel("")
         self.scale_label.setObjectName("Hint")
         self.scale_label.setWordWrap(True)
-        root.addWidget(self.scale_label)
-
-        self.note_label = _AutoHideLabel("")
-        self.note_label.setObjectName("Hint")
-        self.note_label.setWordWrap(True)
-        root.addWidget(self.note_label)
+        self.body_lay.addWidget(self.scale_label)
 
         # ---- 逐剖面设置块
         self.slices_body = QtWidgets.QFrame()
@@ -948,10 +1149,6 @@ class ExportDialog(QtWidgets.QDialog):
         self.combo_axis.currentIndexChanged.connect(lambda _i: self._on_axis())
         self.edit_name = QtWidgets.QLineEdit(self._stem)     # 先填一个具体名字，用户可改
         self.edit_name.setPlaceholderText("可留空，留空就是 0 / 1 / 2 …")
-        self.edit_name.setToolTip(
-            "生成的文件名 = 文件名 + 下划线 + 序号 + 目标格式，例如 demo_7.mat。\n"
-            "序号就是该方向的炮号 / 道号 / 时间采样号。\n"
-            "留空则直接用序号做文件名，例如 7.mat。")
         self.edit_name.textChanged.connect(lambda _t: self._refresh_texts())
         for i, (label, w) in enumerate([("剖面方向", self.combo_axis),
                                        ("文件名", self.edit_name)]):
@@ -972,13 +1169,11 @@ class ExportDialog(QtWidgets.QDialog):
         for sp in (self.spin_start, self.spin_stop):
             sp.setRange(0, 0)
             sp.setMinimumWidth(78)
-            sp.setToolTip("片层下标（从 0 开始）；起止都是闭区间端点。")
             sp.valueChanged.connect(lambda _v: self._refresh_texts())
         tilde = QtWidgets.QLabel("~")
         tilde.setObjectName("Hint")
         self.btn_cur = QtWidgets.QPushButton("设为当前")
         self.btn_cur.setObjectName("Ghost")
-        self.btn_cur.setToolTip("把范围设为当前剖面所在的那一片")
         self.btn_cur.clicked.connect(self._set_range_current)
         rrow.addWidget(rlab)
         rrow.addWidget(self.spin_start)
@@ -990,33 +1185,283 @@ class ExportDialog(QtWidgets.QDialog):
 
         self.chk_current = QtWidgets.QCheckBox(
             "只导出当前显示的剖面（对比时含全部数据源）")
-        self.chk_current.setToolTip(
-            "勾上就只导出当前剖面面板正在显示的那一片，忽略上面的片层范围。\n"
-            "多数据对比时，每份数据各导出自己当前显示的那一片。")
         self.chk_current.toggled.connect(self._on_current_toggled)
         body.addWidget(self.chk_current)
-
-        # 一句话说清规则 + 一个具体例子，两行永远有内容（空标签会被样式刷成暗方块）
-        self.slice_rule = QtWidgets.QLabel("")
-        self.slice_rule.setObjectName("Hint")
-        self.slice_rule.setWordWrap(True)
-        body.addWidget(self.slice_rule)
 
         self.slice_preview = QtWidgets.QLabel("")
         self.slice_preview.setObjectName("Hint")
         self.slice_preview.setWordWrap(True)
         body.addWidget(self.slice_preview)
-        root.addWidget(self.slices_body)
+        self.body_lay.addWidget(self.slices_body)
 
-        # ---- 图片说明（剖面图 / 波形图）
-        self.image_note = QtWidgets.QLabel(
-            "导出的是**论文用图**：白底、深色坐标轴，横纵轴读数按设置面板里的\n"
-            "dt / dx / ds 换算成秒与米，剖面图另带振幅色条。PNG 为位图，SVG 为矢量。\n"
-            "剖面图用的是当前切片的全分辨率数据（不是屏幕上的抽稀画面）；AGC 开着\n"
-            "时会做同样的增益处理。多数据对比时，每份数据各导出一个文件。")
-        self.image_note.setObjectName("Hint")
-        self.image_note.setWordWrap(True)
-        root.addWidget(self.image_note)
+        # ---- 出图设置（剖面图 / 波形图）
+        self.figure_body = QtWidgets.QGroupBox("出图设置")
+        fgrid = QtWidgets.QGridLayout(self.figure_body)
+        fgrid.setHorizontalSpacing(10)
+        fgrid.setVerticalSpacing(6)
+
+        self.spin_w_mm = WheelSafeDoubleSpinBox()
+        self.spin_w_mm.setRange(20.0, 500.0)
+        self.spin_w_mm.setDecimals(1)
+        self.spin_w_mm.setValue(180.0)
+        self.spin_w_mm.setSuffix(" mm")
+        self.spin_w_mm.setMaximumWidth(110)
+        self.spin_h_mm = WheelSafeDoubleSpinBox()
+        self.spin_h_mm.setRange(20.0, 500.0)
+        self.spin_h_mm.setDecimals(1)
+        self.spin_h_mm.setValue(130.0)
+        self.spin_h_mm.setSuffix(" mm")
+        self.spin_h_mm.setMaximumWidth(110)
+        self.spin_dpi = WheelSafeSpinBox()
+        self.spin_dpi.setRange(72, 600)
+        self.spin_dpi.setValue(300)
+        self.spin_dpi.setSuffix(" DPI")
+        self.spin_dpi.setMaximumWidth(110)
+        size_row = QtWidgets.QHBoxLayout()
+        size_row.setContentsMargins(0, 0, 0, 0)
+        size_row.setSpacing(6)
+        for name, w in (("宽度", self.spin_w_mm), ("高度", self.spin_h_mm),
+                        ("分辨率", self.spin_dpi)):
+            lab = QtWidgets.QLabel(name)
+            lab.setObjectName("Hint")
+            size_row.addWidget(lab)
+            size_row.addWidget(w)
+            size_row.addSpacing(8)
+        size_row.addStretch(1)
+        fgrid.addLayout(size_row, 0, 0, 1, 6)
+
+        self.combo_font = WheelSafeComboBox()
+        for name in FONT_FAMILIES:
+            self.combo_font.addItem(name, name)
+        self.combo_font.setMaximumWidth(150)
+        self.spin_font_pt = WheelSafeDoubleSpinBox()
+        self.spin_font_pt.setRange(5.0, 24.0)
+        self.spin_font_pt.setDecimals(1)
+        self.spin_font_pt.setValue(14.0)
+        self.spin_font_pt.setSuffix(" pt")
+        self.spin_font_pt.setMaximumWidth(92)
+        self.spin_line_pt = WheelSafeDoubleSpinBox()
+        self.spin_line_pt.setRange(0.3, 3.0)
+        self.spin_line_pt.setDecimals(1)
+        self.spin_line_pt.setValue(1.0)
+        self.spin_line_pt.setSingleStep(0.1)
+        self.spin_line_pt.setSuffix(" pt")
+        self.spin_line_pt.setMaximumWidth(92)
+        self.combo_ticks = WheelSafeComboBox()
+        self.combo_ticks.addItem("内部", True)
+        self.combo_ticks.addItem("外部", False)
+        self.combo_ticks.setMaximumWidth(92)
+        font_row = QtWidgets.QHBoxLayout()
+        font_row.setContentsMargins(0, 0, 0, 0)
+        font_row.setSpacing(6)
+        for name, w in (("字体", self.combo_font), ("字号", self.spin_font_pt),
+                        ("线宽", self.spin_line_pt), ("刻度线", self.combo_ticks)):
+            lab = QtWidgets.QLabel(name)
+            lab.setObjectName("Hint")
+            font_row.addWidget(lab)
+            font_row.addWidget(w)
+            font_row.addSpacing(8)
+        font_row.addStretch(1)
+        fgrid.addLayout(font_row, 1, 0, 1, 6)
+
+        self.colorbar_box = QtWidgets.QWidget()
+        cbl = QtWidgets.QHBoxLayout(self.colorbar_box)
+        cbl.setContentsMargins(0, 0, 0, 0)
+        cbl.setSpacing(8)
+        self.chk_colorbar = QtWidgets.QCheckBox("色标")
+        self.chk_colorbar.setChecked(True)
+        self.combo_cbar_pos = WheelSafeComboBox()
+        self.combo_cbar_pos.addItem("右侧", "right")
+        self.combo_cbar_pos.addItem("底部", "bottom")
+        self.chk_cbar_label = QtWidgets.QCheckBox("色标文字")
+        self.chk_cbar_label.setChecked(False)      # 论文插图通常只留刻度数字
+        cbl.addWidget(self.chk_colorbar)
+        cbl.addWidget(self.combo_cbar_pos)
+        cbl.addWidget(self.chk_cbar_label)
+        cbl.addStretch(1)
+        fgrid.addWidget(self.colorbar_box, 2, 0, 1, 6)
+
+        self.chk_transparent = QtWidgets.QCheckBox("透明背景")
+        self.title_edit = QtWidgets.QLineEdit()
+        self.title_edit.setPlaceholderText("标题（留空则不显示标题）")
+        lab_lang = QtWidgets.QLabel("图注语言")
+        lab_lang.setObjectName("Hint")
+        self.combo_lang = WheelSafeComboBox()
+        self.combo_lang.addItem("中文", "zh")
+        self.combo_lang.addItem("English", "en")
+        self.combo_lang.setMaximumWidth(104)
+        row3 = QtWidgets.QHBoxLayout()
+        row3.setContentsMargins(0, 0, 0, 0)
+        row3.setSpacing(8)
+        row3.addWidget(self.chk_transparent)
+        row3.addWidget(lab_lang)
+        row3.addWidget(self.combo_lang)
+        row3.addWidget(self.title_edit, 1)
+        fgrid.addLayout(row3, 3, 0, 1, 6)
+
+        # 坐标轴标题：默认按图注语言自动填；改字即自定义，清空即隐藏该轴标题。
+        self.axis_label_row = QtWidgets.QWidget()
+        arow = QtWidgets.QHBoxLayout(self.axis_label_row)
+        arow.setContentsMargins(0, 0, 0, 0)
+        arow.setSpacing(6)
+        self.xaxis_box = QtWidgets.QWidget()
+        xrow = QtWidgets.QHBoxLayout(self.xaxis_box)
+        xrow.setContentsMargins(0, 0, 0, 0)
+        xrow.setSpacing(6)
+        lab_axis = QtWidgets.QLabel("横轴")
+        lab_axis.setObjectName("Hint")
+        self.combo_xaxis = WheelSafeComboBox()
+        self.combo_xaxis.addItem("检波器", False)
+        self.combo_xaxis.addItem("偏移距", True)
+        self.combo_xaxis.setMaximumWidth(92)
+        self.combo_xaxis.currentIndexChanged.connect(self._sync_axis_labels)
+        xrow.addWidget(lab_axis)
+        xrow.addWidget(self.combo_xaxis)
+        arow.addWidget(self.xaxis_box)
+        self.edit_xlabel = QtWidgets.QLineEdit()
+        self.edit_ylabel = QtWidgets.QLineEdit()
+        for name, edit in (("横轴标注", self.edit_xlabel),
+                           ("纵轴标注", self.edit_ylabel)):
+            lab = QtWidgets.QLabel(name)
+            lab.setObjectName("Hint")
+            edit.setPlaceholderText("清空则不显示该轴标题")
+            arow.addWidget(lab)
+            arow.addWidget(edit, 1)
+        fgrid.addWidget(self.axis_label_row, 4, 0, 1, 6)
+        self.combo_lang.currentIndexChanged.connect(self._sync_axis_labels)
+
+        # 刻度数字 / 轴标题可以分别换边（不再固定下方 + 左侧）
+        self.combo_xnums = WheelSafeComboBox()
+        self.combo_xnums.addItem("下方", "bottom")
+        self.combo_xnums.addItem("上方", "top")
+        self.combo_ynums = WheelSafeComboBox()
+        self.combo_ynums.addItem("左侧", "left")
+        self.combo_ynums.addItem("右侧", "right")
+        self.combo_xlabel_side = WheelSafeComboBox()
+        self.combo_xlabel_side.addItem("下方", "bottom")
+        self.combo_xlabel_side.addItem("上方", "top")
+        self.combo_ylabel_side = WheelSafeComboBox()
+        self.combo_ylabel_side.addItem("左侧", "left")
+        self.combo_ylabel_side.addItem("右侧", "right")
+        for combo in (self.combo_xnums, self.combo_ynums,
+                      self.combo_xlabel_side, self.combo_ylabel_side):
+            combo.setMaximumWidth(92)
+        row_x = QtWidgets.QHBoxLayout()
+        row_x.setContentsMargins(0, 0, 0, 0)
+        row_x.setSpacing(6)
+        for name, combo in (("横轴刻度数字", self.combo_xnums),
+                            ("横轴标题", self.combo_xlabel_side)):
+            lab = QtWidgets.QLabel(name)
+            lab.setObjectName("Hint")
+            row_x.addWidget(lab)
+            row_x.addWidget(combo)
+            row_x.addSpacing(16)
+        row_x.addStretch(1)
+        fgrid.addLayout(row_x, 5, 0, 1, 6)
+        row_y = QtWidgets.QHBoxLayout()
+        row_y.setContentsMargins(0, 0, 0, 0)
+        row_y.setSpacing(6)
+        for name, combo in (("纵轴刻度数字", self.combo_ynums),
+                            ("纵轴标题", self.combo_ylabel_side)):
+            lab = QtWidgets.QLabel(name)
+            lab.setObjectName("Hint")
+            row_y.addWidget(lab)
+            row_y.addWidget(combo)
+            row_y.addSpacing(16)
+        row_y.addStretch(1)
+        fgrid.addLayout(row_y, 6, 0, 1, 6)
+
+        # 主刻度间隔：0 = 自动；单位随当前图种 / 剖面方向切换（s 或 m）
+        tick_row = QtWidgets.QHBoxLayout()
+        tick_row.setContentsMargins(0, 0, 0, 0)
+        tick_row.setSpacing(6)
+        lab_tick = QtWidgets.QLabel("刻度间隔")
+        lab_tick.setObjectName("Hint")
+        tick_row.addWidget(lab_tick)
+        for name, attr, unit, edge_attr in (
+                ("横轴", "spin_xtick", "unit_xtick", "chk_xedge"),
+                ("纵轴", "spin_ytick", "unit_ytick", "chk_yedge")):
+            lab = QtWidgets.QLabel(name)
+            lab.setObjectName("Hint")
+            spin = WheelSafeDoubleSpinBox()
+            spin.setRange(0.0, 1_000_000.0)
+            spin.setDecimals(3)
+            spin.setSingleStep(0.1)
+            spin.setValue(0.0)
+            spin.setSpecialValueText("自动")
+            spin.setMaximumWidth(110)
+            axis_key = "x" if attr == "spin_xtick" else "y"
+            spin.valueChanged.connect(
+                lambda _v, k=axis_key: self._tick_edited.__setitem__(k, True))
+            unit_lab = QtWidgets.QLabel("")
+            unit_lab.setObjectName("Hint")
+            unit_lab.setMinimumWidth(14)
+            chk_edge = QtWidgets.QCheckBox("强制两端")
+            chk_edge.setToolTip("刻度间隔不落在轴端点时，也在两端刻度线上显示数值")
+            tick_row.addWidget(lab)
+            tick_row.addWidget(spin)
+            tick_row.addWidget(unit_lab)
+            tick_row.addWidget(chk_edge)
+            tick_row.addSpacing(14)
+            setattr(self, attr, spin)
+            setattr(self, unit, unit_lab)
+            setattr(self, edge_attr, chk_edge)
+        tick_row.addStretch(1)
+        fgrid.addLayout(tick_row, 7, 0, 1, 6)
+
+        # 波形图专属：只导出时间轴上的某一段（秒）
+        self.time_body = QtWidgets.QWidget()
+        trow = QtWidgets.QHBoxLayout(self.time_body)
+        trow.setContentsMargins(0, 0, 0, 0)
+        trow.setSpacing(6)
+        tlab = QtWidgets.QLabel("时间范围")
+        tlab.setObjectName("Hint")
+        tmax = self._time_max()
+        self.spin_t0 = WheelSafeDoubleSpinBox()
+        self.spin_t1 = WheelSafeDoubleSpinBox()
+        for sp, val in ((self.spin_t0, 0.0), (self.spin_t1, tmax)):
+            sp.setRange(0.0, max(0.001, tmax))
+            sp.setDecimals(4)
+            sp.setSingleStep(0.1)
+            sp.setSuffix(" s")
+            sp.setMinimumWidth(104)
+            sp.setValue(val)
+            sp.valueChanged.connect(lambda _v: self._refresh_texts())
+        tilde = QtWidgets.QLabel("~")
+        tilde.setObjectName("Hint")
+        self.btn_time_all = QtWidgets.QPushButton("全段")
+        self.btn_time_all.setObjectName("Ghost")
+        self.btn_time_all.clicked.connect(self._set_time_all)
+        trow.addWidget(tlab)
+        trow.addWidget(self.spin_t0)
+        trow.addWidget(tilde)
+        trow.addWidget(self.spin_t1)
+        trow.addWidget(self.btn_time_all)
+        trow.addStretch(1)
+        fgrid.addWidget(self.time_body, 8, 0, 1, 6)
+
+        prev_row = QtWidgets.QHBoxLayout()
+        prev_row.setContentsMargins(0, 0, 0, 0)
+        prev_row.addStretch(1)
+        self.btn_preview = QtWidgets.QPushButton("预览…")
+        self.btn_preview.setObjectName("Ghost")
+        self.btn_preview.clicked.connect(self.previewRequested.emit)
+        prev_row.addWidget(self.btn_preview)
+        fgrid.addLayout(prev_row, 9, 0, 1, 6)
+        self.body_lay.addWidget(self.figure_body)
+
+        # ---- 导出线型（波形图 / 纯 wiggle 剖面）
+        self.line_style_editor = LineStyleEditor(
+            count=max(1, len(self._entries)), styles=self._line_styles)
+        self.line_style_box = QtWidgets.QGroupBox("导出线型")
+        lsl = QtWidgets.QVBoxLayout(self.line_style_box)
+        lsl.setContentsMargins(12, 6, 12, 10)
+        self.chk_legend = QtWidgets.QCheckBox("显示图例")
+        self.chk_legend.setChecked(True)
+        self.chk_legend.setToolTip("多份数据叠加时，显示每条曲线对应的数据")
+        lsl.addWidget(self.chk_legend)
+        lsl.addWidget(self.line_style_editor)
+        self.body_lay.addWidget(self.line_style_box)
 
         # ---- SEG-Y / SU 专用参数
         # 排版按"哪些是必填、哪些勾了才要填"分成两层：
@@ -1041,16 +1486,12 @@ class ExportDialog(QtWidgets.QDialog):
         self.spin_dt_us.setValue(min(65535, max(1, dt_us)))
         self.spin_dt_us.setSuffix(" µs")
         self.spin_dt_us.setMinimumWidth(120)
-        self.spin_dt_us.setToolTip(
-            "写入文件头（Interval）与每道道头（TRACE_SAMPLE_INTERVAL）。\n"
-            "每道采样数、道数自动取自当前数据，不用填。")
         row.addWidget(lab_dt)
         row.addWidget(self.spin_dt_us, 1)
         sbox.addLayout(row)
 
         self.need_label = QtWidgets.QLabel(
-            f"每道 {self._vol.nt} 个采样、共 {self._vol.ns * self._vol.nr} 道 —— "
-            "这两项自动取自数据。")
+            f"每道 {self._vol.nt} 个采样、共 {self._vol.ns * self._vol.nr} 道")
         self.need_label.setObjectName("Hint")
         self.need_label.setWordWrap(True)
         sbox.addWidget(self.need_label)
@@ -1060,16 +1501,8 @@ class ExportDialog(QtWidgets.QDialog):
         sline.setStyleSheet(f"color: {style.LINE}; background: {style.LINE}; max-height: 1px;")
         sbox.addWidget(sline)
 
-        self.chk_coords = QtWidgets.QCheckBox("写入坐标道头（按间距推算，非实测坐标，可选）")
+        self.chk_coords = QtWidgets.QCheckBox("写入坐标道头")
         self.chk_coords.setChecked(True)
-        self.chk_coords.setToolTip(
-            "勾选后按下面两个间距推算一套「规则」几何写进道头：\n"
-            "SourceX = 炮号 × ds\n"
-            "GroupX  = SourceX + 道号 × dx\n"
-            "offset  = 道号 × dx\n"
-            "等价于「排列随炮整体移动」的滑动排列，三者自洽（offset == GroupX − SourceX）。\n"
-            "dx 带小数时会写入坐标标量，避免小数被取整。\n\n"
-            "暂不支持每炮观测系统排列不同的情况。")
         self.chk_coords.toggled.connect(self._sync_coords_enabled)
         sbox.addWidget(self.chk_coords)
 
@@ -1098,23 +1531,13 @@ class ExportDialog(QtWidgets.QDialog):
                                        ("炮点间距 ds", self.spin_ds)]):
             lb = QtWidgets.QLabel(name)
             lb.setObjectName("Hint")
-            w.setToolTip("按下式推算坐标：SourceX = 炮号 × ds，"
-                         "GroupX = SourceX + 道号 × dx，offset = 道号 × dx")
             grid.addWidget(lb, i, 0)
             grid.addWidget(w, i, 1)
         body.addLayout(grid)
-
-        rule = QtWidgets.QLabel("SourceX = 炮号×ds　GroupX = SourceX + 道号×dx　offset = 道号×dx")
-        rule.setObjectName("Hint")
-        rule.setWordWrap(True)
-        body.addWidget(rule)
         sbox.addWidget(self.coords_body)
 
-        self.seis_note = QtWidgets.QLabel("除此之外不继承源文件道头。")
-        self.seis_note.setObjectName("Hint")
-        self.seis_note.setWordWrap(True)
-        sbox.addWidget(self.seis_note)
-        root.addWidget(self.seis_box)
+        self.body_lay.addWidget(self.seis_box)
+        self.body_lay.addStretch(1)
         self._sync_coords_enabled()
 
         self.error = _AutoHideLabel("")
@@ -1184,6 +1607,184 @@ class ExportDialog(QtWidgets.QDialog):
         """是否是「图片导出」内容（剖面图 / 波形图）。"""
         return self.content() in self.IMAGE_MODES
 
+    def line_styles(self) -> list[tuple[str, str]]:
+        """导出波形图的线型（按数据顺序）。"""
+        return self.line_style_editor.line_styles()
+
+    def _time_max(self) -> float:
+        """所有数据源里最长的一条记录时长（秒）。"""
+        spans = []
+        for entry in self._entries:
+            vol = entry.get("vol")
+            if vol is not None and int(vol.nt) > 0 and float(vol.dt) > 0:
+                spans.append(float(vol.nt) * float(vol.dt))
+        return max(spans, default=1.0)
+
+    def _sync_tick_units(self) -> None:
+        """按当前内容 / 剖面方向更新刻度间隔的单位（s 或 m）。"""
+        content = self.content()
+        if content == "wave_image":
+            xunit, yunit = "s", ""
+        elif content in ("slice_image", "wiggle_image"):
+            xunit = "m"
+            yunit = "s" if self._mode in ("shot", "recv") else "m"
+        else:
+            xunit = yunit = ""
+        for lab, unit in ((self.unit_xtick, xunit), (self.unit_ytick, yunit)):
+            lab.setText(unit)
+            lab.setVisible(bool(unit))
+        # 米制轴点一下加 10 m；秒制轴保留 0.1 s 的细调步进。
+        self.spin_xtick.setSingleStep(10.0 if xunit == "m" else 0.1)
+        self.spin_ytick.setSingleStep(10.0 if yunit == "m" else 0.1)
+        self._sync_tick_defaults()
+
+    def _sync_tick_defaults(self) -> None:
+        """未手动改过时，把刻度间隔填成当前轴跨度的整齐值，而不是「自动」。"""
+        if not hasattr(self, "spin_xtick") or not self.is_image():
+            return
+        x_span, y_span = self._tick_spans()
+        state = (self.content(), self._mode)
+        if state != self._tick_state:
+            self._tick_state = state
+            self._tick_edited = {"x": False, "y": False}
+        if not self._tick_edited["x"]:
+            self._set_tick_value(self.spin_xtick, _nice_tick(x_span))
+        if not self._tick_edited["y"]:
+            self._set_tick_value(self.spin_ytick, _nice_tick(y_span))
+
+    @staticmethod
+    def _set_tick_value(spin, value: float) -> None:
+        spin.blockSignals(True)
+        spin.setValue(float(value))
+        spin.blockSignals(False)
+
+    def _tick_spans(self) -> tuple[float, float]:
+        """当前图片的横 / 纵轴数值跨度；用于给出初始刻度间隔。"""
+        content = self.content()
+        try:
+            if content == "wave_image":
+                span = self.time_range()
+                lo, hi = span if span is not None else (0.0, self._time_max())
+                return max(0.0, hi - lo), self._trace_amp_span()
+            if content in ("slice_image", "wiggle_image"):
+                x0, x1, y0, y1 = (float(v) for v in
+                                  self._vol.extent_of(self._mode))
+                return abs(x1 - x0), abs(y1 - y0)
+        except Exception:                        # pragma: no cover
+            pass
+        return 0.0, 0.0
+
+    def _trace_amp_span(self) -> float:
+        """当前时间窗内单道振幅的跨度，供波形图纵轴刻度间隔取整。"""
+        lo = hi = None
+        span = self.time_range()
+        for entry in self._entries:
+            vol = entry.get("vol")
+            pos = entry.get("pos") or {}
+            if vol is None:
+                continue
+            try:
+                s = max(0, min(int(pos.get("shot", 0)), int(vol.ns) - 1))
+                r = max(0, min(int(pos.get("recv", 0)), int(vol.nr) - 1))
+                amp = np.asarray(vol.data[s, r, :], dtype=float)
+                t = np.arange(amp.size) * float(vol.dt)
+                if span is not None:
+                    amp = amp[(t >= span[0]) & (t <= span[1])]
+                amp = amp[np.isfinite(amp)]
+                if amp.size:
+                    lo = float(amp.min()) if lo is None else min(lo, float(amp.min()))
+                    hi = float(amp.max()) if hi is None else max(hi, float(amp.max()))
+            except Exception:                    # pragma: no cover
+                continue
+        if lo is None or hi is None:
+            return 1.0
+        width = hi - lo
+        return width if width > 0 else max(1.0, abs(hi) * 2)
+
+    def _auto_axis_text(self) -> tuple[str, str]:
+        """当前内容 / 语言 / 横轴选项下的自动轴标题。"""
+        lang = self.combo_lang.currentData() or "zh"
+        if self.content() == "wave_image":
+            text = FIGURE_TEXT.get(lang, FIGURE_TEXT["zh"])
+            return text["wave_x"], text["wave_y"]
+        offset = (self.content() in ("slice_image", "wiggle_image")
+                  and self._mode == "shot"
+                  and bool(self.combo_xaxis.currentData()))
+        labels = figure_labels(self._mode, lang, offset)
+        return labels[0], labels[1]
+
+    def _sync_axis_labels(self, *_args) -> None:
+        """语言或内容变化时，未被用户改过的轴标题跟着自动文字走。"""
+        if not hasattr(self, "edit_xlabel"):
+            return
+        auto = self._auto_axis_text()
+        old = self._auto_axes
+        for edit, was, now in ((self.edit_xlabel, old[0], auto[0]),
+                               (self.edit_ylabel, old[1], auto[1])):
+            if edit.text() == was:
+                edit.setText(now)
+        self._auto_axes = auto
+
+    def time_range(self) -> tuple[float, float] | None:
+        """波形图要导出的时间段（秒）；整段时返回 ``None`` 交给自动范围。"""
+        if self.content() != "wave_image":
+            return None
+        lo = float(self.spin_t0.value())
+        hi = float(self.spin_t1.value())
+        if lo > hi:
+            lo, hi = hi, lo
+        full = self._time_max()
+        if lo <= 1e-9 and hi >= full - 1e-9:
+            return None
+        if hi - lo <= 1e-9:
+            return None
+        return (lo, hi)
+
+    def _set_time_all(self) -> None:
+        for sp, val in ((self.spin_t0, 0.0), (self.spin_t1, self._time_max())):
+            sp.blockSignals(True)
+            sp.setValue(val)
+            sp.blockSignals(False)
+        self._refresh_texts()
+
+    def figure_options(self) -> ExportFigureOptions:
+        """当前「出图设置」的参数快照。"""
+        auto = self._auto_axis_text()
+        x_text = self.edit_xlabel.text()
+        y_text = self.edit_ylabel.text()
+        offset = (self.content() in ("slice_image", "wiggle_image")
+                  and self._mode == "shot"
+                  and bool(self.combo_xaxis.currentData()))
+        return ExportFigureOptions(
+            width_mm=float(self.spin_w_mm.value()),
+            height_mm=float(self.spin_h_mm.value()),
+            dpi=int(self.spin_dpi.value()),
+            font_family=self.combo_font.currentData() or "Arial",
+            font_pt=float(self.spin_font_pt.value()),
+            line_width_pt=float(self.spin_line_pt.value()),
+            colorbar=bool(self.chk_colorbar.isChecked()),
+            colorbar_pos=self.combo_cbar_pos.currentData() or "right",
+            colorbar_label=bool(self.chk_cbar_label.isChecked()),
+            legend=bool(self.chk_legend.isChecked()),
+            ticks_inside=bool(self.combo_ticks.currentData()),
+            x_tick_major=float(self.spin_xtick.value()),
+            y_tick_major=float(self.spin_ytick.value()),
+            x_edge_ticks=bool(self.chk_xedge.isChecked()),
+            y_edge_ticks=bool(self.chk_yedge.isChecked()),
+            offset_axis=offset,
+            x_numbers_side=self.combo_xnums.currentData() or "bottom",
+            y_numbers_side=self.combo_ynums.currentData() or "left",
+            xlabel_side=self.combo_xlabel_side.currentData() or "bottom",
+            ylabel_side=self.combo_ylabel_side.currentData() or "left",
+            # 没改过的轴标题不写死：这样导出全部对比数据时，
+            # 每份数据仍能按自己的剖面方向生成对应的自动标题。
+            xlabel_override=None if x_text == auto[0] else x_text,
+            ylabel_override=None if y_text == auto[1] else y_text,
+            transparent=bool(self.chk_transparent.isChecked()),
+            title=self.title_edit.text().strip(),
+            language=self.combo_lang.currentData() or "zh",
+        )
+
     def _scope_all(self) -> bool:
         # 只用"条目数"判断而不是 isVisible()：弹出前（或离屏测试时）面板还没显示，
         # isVisible() 一律为 False，会把"全部对比数据"误判成"当前数据"。
@@ -1245,15 +1846,19 @@ class ExportDialog(QtWidgets.QDialog):
         seis = content == "volume" and self.fmt() in exporter.SEISMIC_KEYS
         self.seis_box.setVisible(seis)
         self.slices_body.setVisible(content == "slices")
-        self.image_note.setVisible(self.is_image())
+        self.figure_body.setVisible(self.is_image())
+        self.line_style_box.setVisible(content in ("wiggle_image", "wave_image"))
+        self.colorbar_box.setVisible(content == "slice_image")
+        self.time_body.setVisible(content == "wave_image")
+        self.axis_label_row.setVisible(self.is_image())
+        self.xaxis_box.setVisible(content in ("slice_image", "wiggle_image")
+                                  and self._mode == "shot")
+        if self.is_image():
+            self._sync_axis_labels()
+        self._sync_tick_units()
+        self.line_style_editor.set_count(max(1, len(self._entries)))
         self.scope_row.setVisible(
             content in ("slices", "slice_image") and len(self._entries) > 1)
-        if content == "volume":
-            self.note_label.setText("" if seis else
-                                    "⚠ 只导出数据矩阵（形状 = 炮 × 检波器 × 时间）：\n"
-                                    "不含 dt / dx / ds 等元信息（标尺会丢）；缺道以 0 填充。")
-        else:
-            self.note_label.setText("")
         self.error.setText("")
         self._refresh_texts()
 
@@ -1282,6 +1887,7 @@ class ExportDialog(QtWidgets.QDialog):
         self._refresh_path()
         self._refresh_scale_label()
         self._refresh_slice_texts()
+        self._sync_tick_defaults()
         self._refit_height()
 
     def _refresh_path(self) -> None:
@@ -1304,11 +1910,11 @@ class ExportDialog(QtWidgets.QDialog):
             p = p.with_suffix(suffix)
         else:
             base = p if (p is not None and str(p)) else Path(self._dir)
-            p = base / (self._stem + suffix)
+            p = base / (self._export_stem + suffix)
         self.path_edit.setText(str(p))
 
     def _refresh_scale_label(self) -> None:
-        """规模说明：整卷报整卷，逐剖面报片数与范围，图片报"论文用图"。"""
+        """规模说明：只报数据的形状、片数与文件数。"""
         content = self.content()
         if content == "slices":
             axis = self.slice_axis()
@@ -1317,8 +1923,8 @@ class ExportDialog(QtWidgets.QDialog):
             n = self.entry_count() if self._scope_all() else 1
             if self.chk_current.isChecked():
                 self.scale_label.setText(
-                    f"仅导出当前显示的剖面：沿「{exporter.SLICE_LABEL_OF.get(axis, axis)}」"
-                    f"各数据源当前第 {self._current_index(axis)} 片（共 {total} 片），"
+                    f"沿「{exporter.SLICE_LABEL_OF.get(axis, axis)}」各数据源当前第 "
+                    f"{self._current_index(axis)} 片（共 {total} 片），"
                     f"每片 {rows} × {cols}，共 {n} 个文件")
             else:
                 a, b = self.slice_range()
@@ -1326,63 +1932,75 @@ class ExportDialog(QtWidgets.QDialog):
                     exporter.describe_slices(self._vol.data, axis, self.fmt(), a, b))
         elif content == "slice_image":
             n = self.entry_count() if self._scope_all() else 1
-            axis = self.slice_axis()
-            rows, cols = exporter.slice_shape(self._vol.data, axis)
+            rows, cols = exporter.slice_shape(self._vol.data, self._mode)
             self.scale_label.setText(
-                f"论文用图：白底、物理坐标轴（时间 s / 空间 m）、振幅色条；"
-                f"约 {rows} × {cols} 采样点全分辨率重绘，共 {n} 个文件")
+                f"约 {rows} × {cols} 采样点，共 {n} 个文件")
+        elif content == "wiggle_image":
+            rows, cols = exporter.slice_shape(self._vol.data, self._mode)
+            self.scale_label.setText(
+                f"约 {rows} × {cols} 采样点，共 1 个文件")
         elif content == "wave_image":
-            self.scale_label.setText(
-                f"论文用图：白底、物理坐标轴；"
-                f"{'各数据源曲线叠在一张图里' if self.entry_count() > 1 else '当前道'}，"
-                f"共 1 个文件")
+            span = self.time_range()
+            when = (f"时间 {span[0]:g} – {span[1]:g} s"
+                    if span is not None
+                    else f"全部时间 0 – {self._time_max():g} s")
+            self.scale_label.setText(f"{when}，共 1 个文件")
         else:
             self.scale_label.setText(exporter.describe(self._vol.data, self.fmt()))
 
     def _refresh_slice_texts(self) -> None:
-        """逐剖面规则一句 + 例子一行，**两行永远都有内容**（空标签会被样式刷成暗方块）。"""
+        """逐剖面：只显示一两个即将生成的文件名示例。"""
         if self.content() != "slices":
             return
         axis = self.slice_axis()
-        word = exporter.word_of(axis)
         suffix = self.SUFFIX[self.fmt()]
-        self.slice_rule.setText(
-            f"规则：文件名 + 下划线 + {word} + {suffix}；文件名留空就只用{word}。")
         try:
             exporter.check_name(self.name_prefix())
         except exporter.ExportError as exc:
             self.slice_preview.setText(f"⚠ {exc}")
             return
-        total = exporter.slice_count(self._vol.data, axis)
         if self.chk_current.isChecked():
             self.slice_preview.setText(
-                f"例：{exporter.slice_name(self.name_prefix(), self._current_index(axis), suffix)}"
-                f"　每份数据各一片")
+                f"例：{exporter.slice_name(self.name_prefix(), self._current_index(axis), suffix)}")
             return
         a, b = self.slice_range()
         a2, b2 = min(a, b), max(a, b)
         names = [exporter.slice_name(self.name_prefix(), i, suffix)
                  for i in range(a2, min(a2 + 2, b2 + 1))]
         more = "…" if (b2 + 1 - a2) > len(names) else ""
-        self.slice_preview.setText(f"例：{'、'.join(names)}{more}　共 {b2 - a2 + 1} / {total} 个文件")
+        self.slice_preview.setText(f"例：{'、'.join(names)}{more}")
+
+    @staticmethod
+    def _bounded_height(pref: int, avail: int) -> int:
+        """对话框高度不超过可用屏幕；低于 200 时仍保留基本可读性。"""
+        return max(200, min(int(pref), int(avail)))
 
     def _refit_height(self) -> None:
-        """按当前宽度重算高度，把多出来的留白收回去。
+        """按当前宽度重算高度，并把上限压到可用屏幕高度内。
 
-        顶层窗口只在布局**要求变大**时才会跟着长（所以切到 SEG-Y / SU 会自己长高），
-        反过来缩小它不管 —— 切回矩阵格式后底部就留一大片空白。宽度保持用户拖出来的值。
-        构造期（还没显示）不调：那时窗口还没有真实尺寸，硬 resize 会把
-        首次弹出的大小钉死在 640×480 这种默认值上，让 Qt 自己按 sizeHint 定更合适。
+        中间设置区在 ``QScrollArea`` 里，超出部分由滚动条消化；
+        构造期（还没显示）不调，让 Qt 先按 sizeHint 定首次尺寸。
         """
         if not self.isVisible() or self.layout() is None:
             return
         lay = self.layout()
         lay.activate()
+        self.body_lay.activate()
         w = self.width()
-        h = lay.heightForWidth(w)
-        if h <= 0:                                  # 极端情况下退回 sizeHint
-            h = self.sizeHint().height()
-        self.resize(w, max(h, self.minimumSizeHint().height()))
+        # 固定部分（标题 / 内容类型 / 错误 / 按钮）的估算：
+        # 外层 sizeHint 减去滚动区本身的 sizeHint，剩下的是固定行。
+        # 中间内容用 body 布局按当前可用宽度量高，再一起夹到屏幕高度内。
+        fixed = max(0, lay.sizeHint().height() - self.scroll.sizeHint().height())
+        body_w = max(300, self.scroll.viewport().width())
+        body_h = self.body_lay.heightForWidth(body_w)
+        if body_h <= 0:
+            body_h = self.body.sizeHint().height()
+        pref = fixed + body_h
+        if pref <= 0:                               # 极端情况下退回 sizeHint
+            pref = self.sizeHint().height()
+        screen = self.screen() or QtWidgets.QApplication.primaryScreen()
+        avail = screen.availableGeometry().height() - 60 if screen else pref
+        self.resize(w, self._bounded_height(pref, avail))
 
     def showEvent(self, ev) -> None:                # noqa: N802 （Qt 接口名）
         """弹出时先按「重算高度」的算法定一次尺寸。
@@ -1424,15 +2042,13 @@ class ExportDialog(QtWidgets.QDialog):
         scope = "全部对比数据" if self._scope_all() else "当前数据"
 
         if content in self.IMAGE_MODES:
-            lines.append(f"数据源：{scope}" if content == "slice_image"
-                         else "数据源：全部曲线")
             if content == "wave_image":
-                lines.append("画面：当前单道波形（白底、坐标轴按 dt 标出秒）")
+                lines.append("画面：当前单道波形")
             else:
                 axis = self.slice_axis()
                 idx = self._current_index(axis)
                 lines.append(f"画面：当前剖面（沿「{exporter.SLICE_LABEL_OF.get(axis, axis)}」"
-                             f"第 {idx} 片；白底、物理坐标轴、振幅色条）")
+                             f"第 {idx} 片）")
             lines.append(f"保存到：{self.path()}")
             return "\n".join(lines)
 
@@ -1496,6 +2112,26 @@ class ExportDialog(QtWidgets.QDialog):
         box.exec()
         return box.clickedButton() is ok
 
+    @staticmethod
+    def _is_source_path(path: str, source: str) -> bool:
+        """目标路径是否就是当前数据源文件（不允许原地覆盖）。"""
+        if not path or not source:
+            return False
+        try:
+            return Path(path).resolve() == Path(source).resolve()
+        except OSError:                              # pragma: no cover
+            return False
+
+    def _suffix_message(self, path: str) -> str | None:
+        """保存后缀与所选格式不一致时返回给用户看的提示。"""
+        p = Path(path)
+        if not p.suffix:
+            return None
+        want = self.SUFFIX[self.fmt()]
+        if p.suffix.lower() != want:
+            return f"保存文件名后缀必须与所选格式一致：{want}（当前 {p.suffix}）。"
+        return None
+
     def _validate(self) -> None:
         content, path = self.content(), self.path()
         if content == "slices":
@@ -1529,23 +2165,35 @@ class ExportDialog(QtWidgets.QDialog):
         if p.parent and not p.parent.exists():
             self._fail(f"目录不存在：{p.parent}")
             return
+        if not p.suffix:
+            # 手动输入了不带后缀的名字：补成与格式一致的后缀（可见地写回输入框）
+            p = p.with_suffix(self.SUFFIX[self.fmt()])
+            self.path_edit.setText(str(p))
+            path = str(p)
+        if self._is_source_path(path, self._source_path):
+            self._fail("不能覆盖当前数据源文件，请换一个文件名。")
+            return
+        suffix_msg = self._suffix_message(path)
+        if suffix_msg:
+            self._fail(suffix_msg)
+            return
         if self._confirm():
             self.accept()
 
 
 # ==================================================================== 悬浮胶囊
 class PanelCapsule(QtWidgets.QFrame):
-    """工作区右上角的「面板开关 + 摆法」胶囊：横排三个小图标 + 分隔线 + 「分屏」键。
+    """工作区右上角的「面板开关 + 交换 + 复位」胶囊：横排三个小图标 + 分隔线 + 两枚动作键。
 
     浮在内容之上、不占布局高度。几个刻意的取舍：
 
     * 三个图标按维度 1 → 2 → 3（单道波形 / 剖面 / 三维）；
     * 每个图标 = 左侧停靠条 + 类型图形：条**宽而亮** = 这类面板开着，只剩细线 = 已收起；
-    * 三个图标都是**纯开关** —— 点一下只会"显示↔收起"，含义与当前状态无关。
-      以前同一个点击按状态有三种含义（收起中的=加进来 / 显示中的=只看它 / 唯一的=
-      退回上次组合），用户得先记住当前状态才知道点了会怎样，所以拆掉了；
-      "只看这一块"改由快捷键 1/2/3、Tab，或「分屏」键打开的摆法面板承担；
-    * 「分屏」键 = 打开摆法面板（用户自己连信号，见 ``LayoutPicker``）；
+      当前数据用不到的面板（一维的剖面/三维、二维的三维）直接**置灰不可点**；
+    * 三个图标都是**纯开关** —— 点一下只会"显示↔收起"，含义与当前状态无关；
+      "只看这一块"由快捷键 1/2/3、Tab 承担；
+    * 「⇄」交换可换序的两块；刷新键 = 复位布局／找回所有面板；
+    * 摆法默认值在「窗口设置 → 默认分屏设置」里配，不再占用胶囊；
     * 「剖面」图标下方用 1–3 个圆点表示"现在有几块、哪几块被拉出成了独立窗口"。
       不写数字——数字会被读成"这块属于数据 2"，而它其实要表达"有 2 块"。
     """
@@ -1584,15 +2232,12 @@ class PanelCapsule(QtWidgets.QFrame):
         self.swap_btn.setFixedSize(24, 24)
         self.swap_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         lay.addWidget(self.swap_btn, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
-        self.split_btn = QtWidgets.QToolButton()
-        self.split_btn.setObjectName("CapsuleBtnSplit")
-        self.split_btn.setText("分屏")
-        self.split_btn.setToolButtonStyle(
-            QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        self.split_btn.setIconSize(QtCore.QSize(18, 18))
-        self.split_btn.setFixedHeight(24)
-        self.split_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        lay.addWidget(self.split_btn, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        self.reset_btn = QtWidgets.QToolButton()
+        self.reset_btn.setObjectName("CapsuleBtn")
+        self.reset_btn.setIconSize(QtCore.QSize(20, 20))
+        self.reset_btn.setFixedSize(24, 24)
+        self.reset_btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        lay.addWidget(self.reset_btn, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
 
         self.setFixedHeight(32 + self.DOT_ON + 3)
         self._dots: list[bool] = []
@@ -1732,22 +2377,27 @@ class LayoutThumb(QtWidgets.QWidget):
     # 星标的位置与热区（左上角，避开右上角那枚"当前"药丸）
     STAR_RECT = QtCore.QRectF(6.0, 4.0, 15.0, 15.0)
 
-    def __init__(self, key: str, parent=None):
+    def __init__(self, key: str, parent=None, *, default_only: bool = False,
+                 size: tuple[int, int] = (116, 74),
+                 show_active_pill: bool = True):
         super().__init__(parent)
         self.key = key
         self.order = ("slice", "right")
         self.active = False
         self.default = False                # 是不是"当前生效的默认"
+        self.default_only = bool(default_only)
+        self.show_active_pill = bool(show_active_pill)
         self._hover = False
-        self.setFixedSize(116, 74)
+        self.setFixedSize(*size)
         self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self._sync_tooltip()
 
     def _sync_tooltip(self) -> None:
+        if self.default_only:
+            self.setToolTip(f"{LAYOUT_TITLE.get(self.key, self.key)}　点 ★ 设为默认")
+            return
         self.setToolTip(
-            f"{LAYOUT_TITLE.get(self.key, self.key)}\n"
-            "点缩略图 = 立刻切到这一张（不改默认）\n"
-            "点左上角 ★ = 把这一张设为默认布局")
+            f"{LAYOUT_TITLE.get(self.key, self.key)}　点缩略图切换；点 ★ 设为默认")
 
     def set_spec(self, order, active: bool, is_default: bool = False) -> None:
         self.order, self.active = tuple(order), bool(active)
@@ -1773,7 +2423,7 @@ class LayoutThumb(QtWidgets.QWidget):
         if self._star_hit().contains(pos):               # 星标：只设默认，不切摆法
             self.defaultToggled.emit(self.key)
             return
-        if self.rect().contains(pos.toPoint()):
+        if self.rect().contains(pos.toPoint()) and not self.default_only:
             self.clicked.emit()
 
     def paintEvent(self, ev) -> None:                    # noqa: N802 （Qt 接口名）
@@ -1792,7 +2442,7 @@ class LayoutThumb(QtWidgets.QWidget):
                             2.0 if self.active else 1.0))
         p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(QtCore.QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0), 5, 5)
-        if self.active:
+        if self.active and self.show_active_pill:
             p.setPen(QtCore.Qt.PenStyle.NoPen)
             p.setBrush(QtGui.QColor(style.ACCENT))
             pill = QtCore.QRectF(self.width() - 34.0, 2.0, 32.0, 13.0)
@@ -1919,9 +2569,6 @@ class LayoutPicker(QtWidgets.QFrame):
         # 星标的图例 + 一键清掉自定义的默认（回到内置的 B / 各组合规范先后）
         self.btn_defaults = QtWidgets.QPushButton("恢复内置默认布局")
         self.btn_defaults.setObjectName("Ghost")
-        self.btn_defaults.setToolTip(
-            "清掉自定义的默认布局，回到内置的那一套：\n"
-            "三块 → B（主+侧+底）；两块 → 剖面在左、三维在上、单道在下。")
         self.btn_defaults.clicked.connect(self.restoreDefaultsRequested.emit)
         root.addWidget(self.btn_defaults)
 
@@ -1929,9 +2576,6 @@ class LayoutPicker(QtWidgets.QFrame):
         # 状态错乱），这一条一键把所有面板收回主窗口并恢复默认摆法。
         self.btn_reset = QtWidgets.QPushButton("复位布局／找回所有面板")
         self.btn_reset.setObjectName("Ghost")
-        self.btn_reset.setToolTip(
-            "把拉到独立窗口的面板全部收回主窗口，并按**当前默认布局**重新排一次。\n"
-            "面板找不到时点这里。")
         self.btn_reset.clicked.connect(self.resetRequested.emit)
         root.addWidget(self.btn_reset)
 
@@ -2678,33 +3322,22 @@ def _theme_swatch_pixmap(key: str, w: int = 46, h: int = 14) -> QtGui.QPixmap:
 
 
 class PreferencesDialog(QtWidgets.QDialog):
-    """窗口设置：管左侧图标轨道里**加入哪些设置分组**，以及界面配色主题。
+    """窗口设置：左侧轨道显示哪些分组、窗口是否跟随排版，以及两个子设置入口。
 
-    第一版只做两件事，都围绕"这个界面该显示什么"：
-
-    * **侧边栏**：勾选哪些分组出现在左侧轨道上。加入的图标点了会"跳到该设置"
-      （展开左栏 + 展开那一组 + 滚过去高亮），不是"只显示一种"；
-    * **外观**：选界面配色主题（含"跟随系统"）。**改主题不影响导出的 PNG/SVG** ——
-      那一路永远是论文白底。
-
-    主题**边选边生效**（所见即所得）：每点一个主题就通过 ``on_theme`` 通知主窗口
-    立刻换一次；点"取消"时把进来时的主题原样还回去。
-
-    分组的顺序 / 名词 / 说明由主窗口传进来，避免这里反向依赖 ``main_window``。
+    外观与默认分屏各自放在独立窗口里，主设置只保留入口按钮，避免越拉越长。
     """
 
-    def __init__(self, group_order, group_titles, group_tips,
-                 selected, theme_key="deepblue", on_theme=None,
-                 follow_layout=True, show_split=True, parent=None):
+    appearanceRequested = QtCore.Signal()
+    splitDefaultsRequested = QtCore.Signal()
+
+    def __init__(self, group_order, group_titles,
+                 selected, follow_layout=True, parent=None):
         super().__init__(parent)
         self.setWindowTitle("窗口设置")
         self.setModal(True)
         self.setMinimumWidth(470)
         self._order = list(group_order)
         self._checks: dict[str, QtWidgets.QCheckBox] = {}
-        self._theme_radios: dict[str, QtWidgets.QRadioButton] = {}
-        self._original_theme = theme_key
-        self._on_theme = on_theme
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(18, 16, 18, 14)
@@ -2720,22 +3353,13 @@ class PreferencesDialog(QtWidgets.QDialog):
         col.setContentsMargins(12, 6, 12, 10)
         col.setSpacing(8)
         for key in self._order:
-            row = QtWidgets.QWidget()
-            h = QtWidgets.QHBoxLayout(row)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(10)
             cb = QtWidgets.QCheckBox(group_titles[key])
             cb.setChecked(key in selected)
             cb.setIcon(QtGui.QIcon(icons.group(key, 16, style.TEXT_DIM)))
             cb.setIconSize(QtCore.QSize(16, 16))
             cb.setMinimumWidth(124)
             self._checks[key] = cb
-            tip = QtWidgets.QLabel(group_tips[key])
-            tip.setObjectName("Hint")
-            tip.setWordWrap(True)
-            h.addWidget(cb, 0)
-            h.addWidget(tip, 1)
-            col.addWidget(row)
+            col.addWidget(cb)
 
         quick = QtWidgets.QHBoxLayout()
         quick.setContentsMargins(0, 0, 0, 0)
@@ -2751,37 +3375,6 @@ class PreferencesDialog(QtWidgets.QDialog):
         col.addLayout(quick)
         root.addWidget(box)
 
-        # ---- 外观：界面配色主题（边选边生效；导出图永远是论文白底，不受影响）
-        abox = QtWidgets.QGroupBox("外观")
-        acol = QtWidgets.QVBoxLayout(abox)
-        acol.setContentsMargins(12, 6, 12, 10)
-        acol.setSpacing(6)
-        self._theme_group = QtWidgets.QButtonGroup(self)
-        self._theme_group.setExclusive(True)
-        for key, label in style.theme_choices():
-            rb = QtWidgets.QRadioButton(label)
-            rb.setChecked(key == theme_key)
-            rb.toggled.connect(lambda on, k=key: on and self._preview_theme(k))
-            self._theme_group.addButton(rb)
-            self._theme_radios[key] = rb
-            row = QtWidgets.QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(8)
-            row.addWidget(rb)
-            row.addStretch(1)
-            swatch = QtWidgets.QLabel()
-            swatch.setPixmap(_theme_swatch_pixmap(key))
-            swatch.setToolTip("底色 / 面板 / 强调色")
-            row.addWidget(swatch)
-            acol.addLayout(row)
-        atip = QtWidgets.QLabel(
-            "「跟随系统」会跟着 Windows 的浅色/深色自动切。\n"
-            "只改界面配色；导出的 PNG / SVG 始终是论文白底。")
-        atip.setObjectName("Hint")
-        atip.setWordWrap(True)
-        acol.addWidget(atip)
-        root.addWidget(abox)
-
         # ---- 窗口：总窗口大小要不要跟着右侧排版一起变
         wbox = QtWidgets.QGroupBox("窗口大小")
         wcol = QtWidgets.QVBoxLayout(wbox)
@@ -2790,34 +3383,24 @@ class PreferencesDialog(QtWidgets.QDialog):
         self.chk_follow = QtWidgets.QCheckBox("窗口大小跟随排版自动调整")
         self.chk_follow.setChecked(bool(follow_layout))
         wcol.addWidget(self.chk_follow)
-        wtip = QtWidgets.QLabel(
-            "打开时：切到单块、开关某一块、换摆法时，总窗口会按当前排版的自然尺寸\n"
-            "一起变大或变小，避免只剩一块时被硬撑变形。\n"
-            "关掉时：窗口只在空间不够时变大，绝不缩小（完全交给手动调整）。")
-        wtip.setObjectName("Hint")
-        wtip.setWordWrap(True)
-        wcol.addWidget(wtip)
         root.addWidget(wbox)
 
-        # ---- 分屏面板：胶囊上那颗「分屏」快捷按钮要不要出现
-        sbox = QtWidgets.QGroupBox("分屏面板")
-        scol = QtWidgets.QVBoxLayout(sbox)
-        scol.setContentsMargins(12, 6, 12, 10)
-        scol.setSpacing(6)
-        self.chk_split = QtWidgets.QCheckBox("在胶囊上显示「分屏」快捷按钮")
-        self.chk_split.setChecked(bool(show_split))
-        scol.addWidget(self.chk_split)
-        stip = QtWidgets.QLabel(
-            "关掉后胶囊上的「分屏」按钮隐藏，摆法面板也不会再弹出。\n"
-            "布局仍可用「拖动面板标题行」与「⇄」调整；默认布局照旧生效。")
-        stip.setObjectName("Hint")
-        stip.setWordWrap(True)
-        scol.addWidget(stip)
-        root.addWidget(sbox)
-
-        note = QtWidgets.QLabel("更多设置后续加入。")
-        note.setObjectName("Hint")
-        root.addWidget(note)
+        # ---- 子设置入口：小按钮，放在窗口大小下面
+        more = QtWidgets.QHBoxLayout()
+        more.setContentsMargins(0, 0, 0, 0)
+        more.setSpacing(8)
+        btn_appearance = QtWidgets.QPushButton("外观…")
+        btn_appearance.setObjectName("Ghost")
+        btn_appearance.setFixedWidth(94)
+        btn_appearance.clicked.connect(self.appearanceRequested.emit)
+        more.addWidget(btn_appearance)
+        btn_split = QtWidgets.QPushButton("默认分屏设置…")
+        btn_split.setObjectName("Ghost")
+        btn_split.setFixedWidth(132)
+        btn_split.clicked.connect(self.splitDefaultsRequested.emit)
+        more.addWidget(btn_split)
+        more.addStretch(1)
+        root.addLayout(more)
 
         # ---- 确认 / 取消
         foot = QtWidgets.QHBoxLayout()
@@ -2833,6 +3416,7 @@ class PreferencesDialog(QtWidgets.QDialog):
         foot.addWidget(cancel)
         foot.addWidget(ok)
         root.addLayout(foot)
+        self.resize(500, max(320, self.sizeHint().height()))
 
     def _set_keys(self, keys) -> None:
         chosen = set(keys)
@@ -2847,28 +3431,178 @@ class PreferencesDialog(QtWidgets.QDialog):
         """总窗口大小是否跟随排版自动调整。"""
         return bool(self.chk_follow.isChecked())
 
-    def show_split_panel(self) -> bool:
-        """胶囊上是否显示「分屏」快捷按钮（关掉后摆法面板不再弹出）。"""
-        return bool(self.chk_split.isChecked())
 
-    # ---------------------------------------------------------------- 外观
-    def _preview_theme(self, key: str) -> None:
-        """点某个主题就立刻换一次（不落盘）——所见即所得。"""
-        if self._on_theme is not None:
-            self._on_theme(key)
+# ==================================================================== 外观
+class AppearanceDialog(QtWidgets.QDialog):
+    """独立的配色主题窗口：边选边预览，取消恢复原主题。"""
+
+    def __init__(self, theme_key="deepblue", on_preview=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("外观")
+        self.setModal(True)
+        self.setMinimumWidth(420)
+        self._original_theme = theme_key
+        self._on_preview = on_preview
+        self._theme_radios: dict[str, QtWidgets.QRadioButton] = {}
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(10)
+
+        head = QtWidgets.QLabel("外观")
+        head.setObjectName("Title")
+        root.addWidget(head)
+
+        group = QtWidgets.QButtonGroup(self)
+        group.setExclusive(True)
+        for key, label in style.theme_choices():
+            rb = QtWidgets.QRadioButton(label)
+            rb.setChecked(key == theme_key)
+            rb.toggled.connect(lambda on, k=key: on and self._preview(k))
+            group.addButton(rb)
+            self._theme_radios[key] = rb
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+            row.addWidget(rb)
+            row.addStretch(1)
+            swatch = QtWidgets.QLabel()
+            swatch.setPixmap(_theme_swatch_pixmap(key))
+            row.addWidget(swatch)
+            root.addLayout(row)
+
+        foot = QtWidgets.QHBoxLayout()
+        foot.setContentsMargins(0, 8, 0, 0)
+        foot.setSpacing(8)
+        foot.addStretch(1)
+        cancel = QtWidgets.QPushButton("取消")
+        cancel.setObjectName("Ghost")
+        cancel.clicked.connect(self.reject)
+        ok = QtWidgets.QPushButton("确定")
+        ok.setObjectName("Primary")
+        ok.clicked.connect(self.accept)
+        foot.addWidget(cancel)
+        foot.addWidget(ok)
+        root.addLayout(foot)
+
+    def _preview(self, key: str) -> None:
+        if self._on_preview is not None:
+            self._on_preview(key)
 
     def theme_key(self) -> str:
-        """当前选中的主题键。"""
         for key, rb in self._theme_radios.items():
             if rb.isChecked():
                 return key
         return self._original_theme
 
     def reject(self) -> None:                            # noqa: N802 （Qt 接口名）
-        """取消：把进来时的主题还回去（预览已经改过界面了）。"""
-        if self._on_theme is not None:
-            self._on_theme(self._original_theme)
+        if self._on_preview is not None:
+            self._on_preview(self._original_theme)
         super().reject()
+
+
+# ==================================================================== 默认分屏
+class SplitDefaultsDialog(QtWidgets.QDialog):
+    """四种面板组合的默认摆法；整块缩略图可点选。"""
+
+    def __init__(self, groups, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("默认分屏设置")
+        self.setModal(True)
+        self.setMinimumWidth(680)
+        self._groups = list(groups or [])
+        self._selected = {
+            g["id"]: (g["selected"]["key"], tuple(g["selected"]["order"]))
+            for g in self._groups
+        }
+        self._thumbs: list[tuple[str, str, tuple, LayoutThumb]] = []
+        self._restored = False
+
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 14)
+        root.setSpacing(10)
+
+        head = QtWidgets.QLabel("默认分屏设置")
+        head.setObjectName("Title")
+        root.addWidget(head)
+
+        for group in self._groups:
+            box = QtWidgets.QGroupBox(group["title"])
+            lay = QtWidgets.QVBoxLayout(box)
+            lay.setContentsMargins(12, 6, 12, 10)
+            lay.setSpacing(6)
+            row = QtWidgets.QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+            for opt in group["options"]:
+                col = QtWidgets.QVBoxLayout()
+                col.setContentsMargins(0, 0, 0, 0)
+                col.setSpacing(3)
+                thumb = LayoutThumb(opt["key"], default_only=False,
+                                    size=(104, 66), show_active_pill=False)
+                thumb.clicked.connect(
+                    lambda gid=group["id"], k=opt["key"], o=opt["order"]:
+                    self._choose(gid, k, o))
+                thumb.defaultToggled.connect(
+                    lambda _k, gid=group["id"], k=opt["key"], o=opt["order"]:
+                    self._choose(gid, k, o))
+                col.addWidget(thumb)
+                self._thumbs.append(
+                    (group["id"], opt["key"], tuple(opt["order"]), thumb))
+                lab = QtWidgets.QLabel(opt["label"])
+                lab.setObjectName("Hint")
+                lab.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                col.addWidget(lab)
+                row.addLayout(col)
+            row.addStretch(1)
+            lay.addLayout(row)
+            root.addWidget(box)
+        self._refresh()
+
+        brow = QtWidgets.QHBoxLayout()
+        brow.setContentsMargins(0, 4, 0, 0)
+        brow.setSpacing(8)
+        btn_restore = QtWidgets.QPushButton("恢复内置默认布局")
+        btn_restore.setObjectName("Ghost")
+        btn_restore.clicked.connect(self._restore_builtin)
+        brow.addWidget(btn_restore)
+        brow.addStretch(1)
+        cancel = QtWidgets.QPushButton("取消")
+        cancel.setObjectName("Ghost")
+        cancel.clicked.connect(self.reject)
+        ok = QtWidgets.QPushButton("确定")
+        ok.setObjectName("Primary")
+        ok.clicked.connect(self.accept)
+        brow.addWidget(cancel)
+        brow.addWidget(ok)
+        root.addLayout(brow)
+
+    def _choose(self, gid: str, key: str, order) -> None:
+        self._selected[gid] = (key, tuple(order))
+        self._restored = False
+        self._refresh()
+
+    def _refresh(self) -> None:
+        for gid, key, order, thumb in self._thumbs:
+            chosen = self._selected.get(gid)
+            on = (chosen is not None and chosen[0] == key
+                  and tuple(chosen[1]) == tuple(order))
+            thumb.set_spec(order, active=on, is_default=on)
+
+    def _restore_builtin(self) -> None:
+        for group in self._groups:
+            builtin = group.get("builtin")
+            if builtin:
+                self._selected[group["id"]] = (
+                    builtin["key"], tuple(builtin["order"]))
+        self._restored = True
+        self._refresh()
+
+    def choices(self) -> dict:
+        return dict(self._selected)
+
+    def restored(self) -> bool:
+        return bool(self._restored)
 
 
 # ==================================================================== 导入意图
@@ -2911,9 +3645,7 @@ class ImportIntentDialog(QtWidgets.QDialog):
         root.addWidget(info)
 
         if compare_blocked:
-            blocked = QtWidgets.QLabel(
-                f"已载入 {current_text}，并且对比数据已达上限；"
-                "只能替换当前激活的一份，或取消。")
+            blocked = QtWidgets.QLabel("对比数据已达上限，只能替换或取消。")
             blocked.setObjectName("Hint")
             blocked.setWordWrap(True)
             root.addWidget(blocked)

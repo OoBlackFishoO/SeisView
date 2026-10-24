@@ -2,39 +2,30 @@
 
 [中文](README.md) | English
 
-SeisView is a desktop visualization tool for seismic data. It provides linked 3D volume, 2D slice and single-trace waveform views, multi-dataset comparison, and image export.
+SeisView is a desktop visualization and conversion tool for seismic data. It provides linked 3D volume, 2D slice and single-trace waveform views, multi-dataset comparison, and export of publication-ready figures and data files.
 
-![SeisView main window](assets/主界面0.3.0.png)
+![SeisView main window](assets/主界面v0.4.0.png)
 
-![Example data loaded](assets/载入示例后的界面0.3.0.png)
+![Example data loaded](assets/载入示例后的界面v0.4.0.png)
 
 ---
 
 ## Features
 
-### What the software does
+- **Data loading**: reads `.npy`, `.npz`, `.mat`, `.sgy` / `.segy` and `.su` files. Files can be dragged into the window or opened from the command line.
+- **Linked views**: the 3D volume, common-shot slice, common-receiver slice, time slice and single-trace waveform stay linked. Selecting a face on the volume or a trace on a slice keeps the slice position and target trace consistent across views.
+- **Multi-dataset comparison**: displays up to three datasets of the same shape side by side, with synchronized slices and target traces. All panels share one color-scale window, and overlaid curves are colored by dataset order.
+- **Display controls**: density image or wiggle-only rendering, color-scale mode, contrast, AGC and render decimation. Controls that do not apply to the current view are disabled.
+- **Sweep browsing**: the playhead or playback moves through slices continuously for inspecting lateral continuity.
+- **Workspace layout**: single-view and split-view modes with several preset layouts. Panels can be reordered, torn off into floating windows, or docked back.
+- **Export and conversion**: whole volumes, per-slice data, slice figures, wiggle slice figures and waveform figures. Figures are written as PNG / SVG with physical axis units; wiggle and waveform figures support curve styles and a legend toggle.
 
-- Loads `.npy`, `.npz`, `.mat`, `.sgy` / `.segy` and `.su` data and organizes it by shot, receiver and time.
-- Provides linked 3D volume, common-shot slice, common-receiver slice, time slice and single-trace waveform views.
-- Supports side-by-side comparison of up to three datasets with the same shape, including synchronized slices, a shared color scale and dataset-ordered colors.
-- Exports whole volumes, per-slice data, current slice figures and current waveform figures.
+## Typical use cases
 
-### Functional effects
-
-- **Linked views**: selecting a face on the 3D volume switches to the corresponding slice; selecting a position on a slice switches the waveform; slice position, target trace and display settings can stay consistent across panels.
-- **Comparison**: datasets are shown side by side and can share slice position and target trace; all panels use one color-scale window, so amplitude strength is directly comparable; overlaid wiggles and traces use distinct colors by dataset order.
-- **Display controls**: density image or wiggle-only rendering, color scale, color limit, contrast, AGC and render decimation. Controls that do not apply are disabled; AGC is disabled on time slices.
-- **Sweep browsing**: use the playhead or playback to move through slices and inspect lateral continuity.
-- **Workspace layout**: single-view and split-view modes, multiple preset layouts; panels can be reordered, torn off into floating windows, or docked back.
-- **Image export**: redraws the current slice or waveform as a white-background PNG / SVG with physical axis units.
-
-### Typical use cases
-
-- Quickly inspect data dimensions, axis order, amplitude range and valid traces.
-- Compare data before/after processing, different processing results, or different display parameters.
+- Inspect data dimensions, axis order, amplitude range and valid traces.
+- Compare data before / after processing, different processing results or different display settings.
 - Perform basic quality control, such as locating missing traces, dead traces and abnormal amplitudes.
 - Produce consistent slice and waveform figures for reports, papers or presentations.
-- Demonstrate the relationship between a 3D volume, orthogonal slices and single traces in teaching.
 
 ## Quick start
 
@@ -75,7 +66,7 @@ When a `.npy` / `.npz` / `.mat` file is opened for the first time, SeisView asks
 
 ### SEG-Y / SU notes
 
-- The sorting rule is fixed: `FieldRecord` → shot, in-shot `TraceNumber` order → receiver, samples → time.
+- The shot, receiver and time dimensions are taken from `FieldRecord`, the in-shot `TraceNumber` order and the samples.
 - When sources and receivers are at different positions, the receiver axis represents the in-shot trace number, and a time slice is a shot/trace index plane.
 - Missing traces are located by trace number and left empty; the load summary reports them.
 - Large files are read on demand; the complete dataset is not loaded into memory when the file is opened.
@@ -91,18 +82,38 @@ When a `.npy` / `.npz` / `.mat` file is opened for the first time, SeisView asks
 | Waveform panel | Shows the current trace; overlays multiple datasets in comparison mode |
 | Panel header | Drag to move or tear off; the slice group header moves all panels, while the inner `⇄` grip only swaps dataset order |
 
+![Settings interface](assets/设置界面v0.4.0.png)
+
 ## Export and conversion
 
-The top-bar **Export / Convert** button (`Ctrl+E`) provides four content types:
+The top-bar **Export / Convert** button (`Ctrl+E`) provides the following content types:
 
 | Content | Formats | Notes |
 | --- | --- | --- |
 | Whole volume | `.npy` / `.npz` / `.mat` / SEG-Y / SU | All samples, shaped shot × receiver × time |
 | Per-slice | `.npy` / `.npz` / `.mat` | One file per slice along a selected direction; optional slice range |
-| Current slice figure | PNG / SVG | White background, physical axes and a color bar |
-| Current waveform figure | PNG / SVG | Current trace; all compared datasets included |
+| Slice figure | PNG / SVG | White background, four-sided axes and a color bar |
+| Wiggle slice figure | PNG / SVG | Wiggle-only figure; all compared datasets overlaid |
+| Waveform figure | PNG / SVG | Current trace; all compared datasets included |
 
-Matrix exports contain only the data, without sampling metadata; missing traces are filled with 0. Figure exports are redrawn from the current slice or waveform and do not include the UI theme or window decoration.
+Matrix exports contain only the data, without sampling metadata; missing traces are filled with 0. Figures are redrawn from the full-resolution slice or trace data (independent of on-screen decimation) and use the current color scale, contrast and AGC settings; they do not include the UI theme or window decoration.
+
+### Publication figure settings
+
+Figure export provides the following settings:
+
+- Physical size (mm) and resolution (DPI); defaults are 180 × 130 mm at 300 DPI.
+- Font, font size (14 pt by default) and line width (1 pt by default, adjustable in 0.1 pt steps).
+- Four-sided axes; ticks can point inward or outward; only major ticks are shown; tick numbers and axis titles can be placed on the top / bottom and left / right sides independently.
+- Separate major tick intervals for the horizontal and vertical axes: seconds for the time axis, meters for the distance axis, amplitude for the waveform axis; `0` means automatic. The first and last tick values can be forced on either axis.
+- Figure text in Chinese or English; axis titles can be customized or hidden; no title is added when the title field is empty.
+- Color bar on the right or bottom, with optional labels; transparent background.
+- For common-shot slices, the horizontal axis can show receiver positions or offset.
+- Wiggle and waveform figures support per-dataset curve colors and line styles, with a legend that can be shown or hidden.
+- The waveform figure can export a selected time range, adjustable in 0.1 s steps.
+- The export preview supports wheel zoom and drag-to-pan.
+
+![Export PNG settings](assets/导出png设置v0.4.0.png)
 
 ## Build the Windows application
 
@@ -112,73 +123,63 @@ Run `build.bat`; the output is:
 dist\SeisView\SeisView.exe
 ```
 
-Keep the version number in `seisview/__init__.py` (`__version__`) and `assets/version_info.txt` (version resource) in sync.
-
-## Project layout
-
-```text
-seisview/
-  volume.py      (S,R,T) data contract, three orthogonal slices, decimation, AGC, color scale
-  loaders.py     file readers: npy / npz / mat / sgy / su (lazy mmap)
-  export.py      export / conversion: matrices, per-slice, SEG-Y / SU with synthesized headers
-  render.py      colormaps, array-to-RGBA, wiggle curves, 3D face textures
-  view2d.py      slice / waveform panels and offscreen paper-figure rendering
-  view3d.py      3D volume (face textures + ray picking + camera animation)
-  widgets.py     custom widgets (capsule, floating panels, fold cards, dialogs, playhead, …)
-  main_window.py assembly, signal wiring, layout / drag gestures, comparison, import / export
-  style.py       palette-based themes and QSS
-  icons.py       hand-drawn icons
-  sample.py      built-in synthetic example
-tests/           headless regression tests (unittest / pytest compatible)
-main.py          entry point
-make_sample.py   generate sample data files
-make_icon.py     generate the application icon
-README.md / README.en.md   Chinese / English docs
-```
-
 ## Requirements
 
 - Python 3.10+
 - PySide6, pyqtgraph, PyOpenGL, numpy, scipy, segyio
-- OpenGL 4.x for the 3D view (if unavailable, slice and waveform still work and a message is shown in the right panel)
+- OpenGL 4.x for the 3D view (if unavailable, slice and waveform views still work and a message is shown in the right panel)
 
 ## Changelog
 
+### v0.4.0
+
+- **Publication figures**: added four-sided axes, inward / outward ticks, movable tick numbers and axis titles, Chinese / English figure text, custom or hidden axis titles, optional title, color-bar position and label switches, and transparent background. The color bar can be placed on the right or bottom, and a bottom bar preserves the slice plot's aspect ratio. Common-shot slices can use an offset axis. Added a separate wiggle slice figure export. Wiggle and waveform figures support per-dataset curve colors and line styles, with a show / hide legend option.
+- **Figure parameters**: output by physical size and DPI; default font 14 pt and line width 1 pt, adjustable in 0.1 pt steps; separate major tick intervals for the horizontal and vertical axes, with an option to force the first and last tick values; larger spacing between tick numbers and tick marks, with end ticks fully visible; waveform export time range adjustable in 0.1 s steps; export preview with zoom and pan.
+- **Color scale**: automatic mode now uses a P99 floor, with P95 / P98 / P99 / manual options. Exported figures use the same color scale, contrast and AGC settings as the on-screen view.
+- **Export workflow**: the settings area scrolls on small screens; default output names do not collide with the current data source, and the source file is protected from accidental overwrite; a file suffix that does not match the selected format is rejected; multi-figure exports can be cancelled, keeping files already written.
+- **Robustness**: NaN / Inf no longer affect the color scale, waveform peak or export bounds; zero-length dimensions are rejected; damaged `.npy` / `.npz` / `.mat` files produce a clear message; replacing a dataset in comparison mode requires the same shape, and a failed comparison import restores the previous data source panel.
+- **Large files and caching**: reopening large `.mat` and SEG-Y / SU files reuses already-read data, and memory is released when data is cleared; a wait cursor and status message are shown while large files are opened, scanned or read.
+- **Interaction**: dragging the reference line on a slice also updates the corresponding 3D slice (time slices stay fixed); the sidebar toggle now collapses all groups when any group is expanded.
+- **Interface**: cleaned up redundant interface text by removing repeated descriptions and extra hints, making the settings area and export dialogs more compact.
+- **Fixes**: fixed missing components that prevented PNG / SVG export in the packaged release; fixed end tick labels in exported figures being clipped or misaligned with their tick marks.
+- **Dependencies**: `pyqtgraph ≥ 0.14`, `segyio ≥ 1.9.14`.
+
 ### v0.3.1
 
-- **One AGC / decimation / color-scale pipeline** shared by 2D slices and 3D face textures; identical rendered arrays for the same face and parameters. Time slices never apply AGC (the control is disabled). Comparison panels share one color-scale window.
-- **Reset only changes the view**: the lower-left `A` button is no longer mistaken for a trace pick, and the first click of a double-click reset is undone, so the green reference line and trace index stay put.
-- **Comparison fixes**: clearing data no longer aborts with an index error and leaves stale images; hovering no longer resizes panels; reordering only changes dataset order, never window or panel sizes.
-- **Interaction polish**: settings groups keep their scroll position when toggled; leaving a slice shows `—`; the on-screen legend is now a compact header legend; a manually resized window becomes the size anchor.
-- **Layout / window**: collapsing the sidebar shrinks the window by the same amount; changing layouts in fullscreen/maximized mode no longer exits it; restoring from maximized returns to the pre-maximized size; tearing off a panel exits fullscreen.
-- **Export progress**: `.mat` / `.npz` serialization shows "正在序列化为 MAT…" and progresses smoothly to 99% instead of freezing at 90%.
-- **Slice area moves as one group**: one six-dot handle on the 「剖面」 group header drags all comparison panels together (tear-off/dock included); a distinct `⇄` grip inside each slice panel only swaps dataset order. Single slices can no longer be torn off alone.
-- **Per-panel slice aspect**: the comparison group's natural width is `N × single-panel natural width`, so panels no longer become thin vertical strips.
-- **Contrast range 10%–1000%** with a logarithmic slider (100% centered).
-- **Faster startup**: 3D and `scipy.signal` are loaded on demand, plus a splash screen. Source-start import path roughly 2.2 s → 0.6 s on the same machine.
-- **Faster SEG-Y / SU header scan**: one strided mmap pass reads both required header words; malformed files fall back automatically. On a 12 MB / 2880-trace file, header scan drops from ~48 ms to ~5 ms. Use `SEISVIEW_PROFILE=1` to see the phase timings.
-- **New themes**: Rose and Frosted Grey (low contrast). Frosted Grey is a low-contrast layered palette, not true background blur (plain Qt widgets cannot blur what is behind them).
+- 2D slices and 3D face textures use the same AGC, decimation and color-scale settings; time slices never apply AGC; comparison panels share one color-scale window.
+- Slice reset only changes the view and no longer changes the selected trace.
+- The slice area moves as one group; a single slice inside the group only swaps dataset order and can no longer be torn off alone; panels keep their normal width in comparison mode.
+- Fixed stale images after clearing comparison data, panel resizing on hover, and window resizing when reordering by drag.
+- Settings groups keep their scroll position when toggled; leaving a slice shows `—`; the on-screen legend is now a compact header legend.
+- Collapsing the sidebar resizes the window by the same amount; changing layouts in fullscreen / maximized mode no longer exits it; restoring returns to the previous window size; tearing off a panel exits fullscreen.
+- `.mat` / `.npz` serialization shows progress text.
+- Contrast range extended to 10%–1000%.
+- New Rose and Frosted Grey themes; new splash screen and faster startup; faster SEG-Y / SU file opening.
 
 ### v0.3.0
 
-- Multi-dataset comparison (up to 3 datasets), sync switch, per-dataset slice panels, colors following left-to-right order.
-- Waveform panel rebuilt: x = time, y = amplitude; overlaid curves for compared datasets; target trace control.
-- Wiggle-only mode; drag-and-drop import; export dialog covering whole volume / per-slice / figures.
-- New layout system (single/split views, 7 layouts, tear-off panels, starrable defaults, 1/3 drop previews).
-- Sidebar rebuilt with icon rail; palette-based themes; window follows layout.
+- Added multi-dataset comparison for up to three datasets of the same shape, with synchronized slices and target traces, and colors following dataset order.
+- The waveform panel now uses time on the horizontal axis and amplitude on the vertical axis, with overlaid datasets in comparison mode.
+- Added wiggle-only display, drag-and-drop import and import-intent confirmation.
+- Export / conversion unified into whole volume, per-slice, slice figure and waveform figure; per-slice export supports slice ranges.
+- 2D data automatically hides the 3D panel.
+- Workspace changed to single-view / split-view modes with several preset layouts; panels can be torn off and docked back.
+- Left settings now use an icon rail with configurable groups; window settings manage groups, themes, window sizing and split layouts.
+- Added multiple interface themes and window sizing that follows the layout.
 
 ### v0.2.0
 
-- Export / conversion to matrices and SEG-Y / SU, with a confirmation dialog before writing.
-- Per-slice export.
-- Auto color limit with a P95 floor; contrast direction inverted to "higher = harder".
-- Density panel grouped into color / gain / wiggle overlay / performance; inapplicable controls greyed out.
-- Slice interaction: left-drag pan, wheel zoom, double-click reset.
-- NaN / Inf safe color scales.
+- Added export / format conversion for matrices and SEG-Y / SU, with confirmation before writing.
+- Added per-slice export.
+- Higher contrast values now produce a harder image.
+- Display settings grouped by function; inapplicable controls are disabled.
+- Slice interaction changed to left-drag pan, wheel zoom and double-click reset.
+- NaN / Inf no longer break the color scale.
+- Fixed wheel changes on controls and export dialogs that did not shrink back.
 
 ### v0.1.0
 
-- First release: linked 3D volume / slice / waveform views, three orthogonal faces, sweep playback, color scale and AGC, wiggle overlay, `npy` / `npz` / `mat` / `sgy` / `su` readers, onedir PyInstaller build.
+- First release: linked 3D volume / slice / waveform views, three orthogonal faces, sweep playback, color scale and AGC, wiggle overlay, `npy` / `npz` / `mat` / `sgy` / `su` readers, onedir packaging.
 
 ## License
 

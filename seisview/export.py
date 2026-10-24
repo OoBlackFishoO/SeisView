@@ -632,10 +632,6 @@ def describe(cube: np.ndarray, fmt: str) -> str:
     nbytes = int(cube.size) * 4          # 统一按 float32 估，避免 int32 溢出
     size = size_text(nbytes)
     text = f"{cube.shape[0]} 炮 × {cube.shape[1]} 道 × {cube.shape[2]} 采样"
-    if fmt in ("mat", "npz"):
-        # 这两个格式的写入库都要一整块连续数组，数据大到一定程度会失败
-        # （真失败时会明确拒绝并建议改用 .npy）
-        return f"{text}\n约 {size}（需要整块进内存，数据过大时可能失败）"
-    if fmt == "npy":
+    if fmt in ("npy", "mat", "npz"):
         return f"{text}\n约 {size}"
-    return f"{text}\n共 {cube.shape[0] * cube.shape[1]} 道，float32，约 {size}"
+    return f"{text}\n共 {cube.shape[0] * cube.shape[1]} 道，约 {size}"

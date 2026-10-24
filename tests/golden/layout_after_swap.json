@@ -1,0 +1,44 @@
+{
+  "content_shown": {
+    "right": true,
+    "slice": true,
+    "trace": true
+  },
+  "effective_shown": {
+    "right": true,
+    "slice": true,
+    "trace": true
+  },
+  "inner_orientation": "Horizontal",
+  "layout_key": "B",
+  "layout_vis": [
+    "slice",
+    "trace",
+    "right"
+  ],
+  "pair_order": [
+    "right",
+    "slice"
+  ],
+  "preset": "B",
+  "root_orientation": "Vertical",
+  "slots": [
+    "right",
+    "slice",
+    "trace"
+  ],
+  "splitter_orientations": [
+    "Horizontal",
+    "Vertical"
+  ],
+  "splitter_ratios": [
+    [
+      0.4314,
+      0.5686
+    ],
+    [
+      0.6704,
+      0.3296
+    ]
+  ]
+}

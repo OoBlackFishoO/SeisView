@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +31,7 @@ import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from . import icons, render, style
+from .figure_options import ExportFigureOptions
 
 # 叠加波形的默认颜色：地震剖面上惯用黑色（底色多为白/红/蓝，黑色最跳）
 _DEFAULT_WIGGLE_COLOR = "#111827"
@@ -54,6 +56,9 @@ def line_pen(style_pair: tuple[str, str], width: float = 1.4):
     color, dash = style_pair
     pen = pg.mkPen(color, width=width)
     pen.setStyle(_PEN_STYLES.get(dash, QtCore.Qt.PenStyle.SolidLine))
+    # 平头笔帽：虚线不会因方头笔帽向两端各伸长半个线宽，空位才是名义上的
+    # 4:2 / 1:2 / 4:2:1:2（按线宽计），与传统制图线型一致。
+    pen.setCapStyle(QtCore.Qt.PenCapStyle.FlatCap)
     return pen
 
 
@@ -152,11 +157,14 @@ class SliceView(pg.PlotWidget):
     hovered = QtCore.Signal(int, int)           # (列号, 行号)，原始数据网格索引
     hover_left = QtCore.Signal()               # 鼠标离开画面 / 移到复位按钮上
     doubleClicked = QtCore.Signal()            # 双击复位视野（先发信号、再复位）
+    referenceDragged = QtCore.Signal(int)      # 拖动绿线：新的横向列号
+    traceStepped = QtCore.Signal(int)          # 聚焦时 ←/→：目标道 ±1
 
     def __init__(self, parent=None):
         super().__init__(parent, background=style.GL_BG)
         self.setMenuEnabled(False)
         self.setMouseEnabled(x=True, y=True)
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.StrongFocus)
 
         vb = self.getViewBox()
         vb.setDefaultPadding(0.0)
@@ -170,7 +178,7 @@ class SliceView(pg.PlotWidget):
         # 并且下面会阻止它被误判成一次取道（绿线错位的根因）。
         self._fit_btn = self.getPlotItem().autoBtn
         try:
-            self._fit_btn.setToolTip("复位视野（回到整幅数据）")
+            self._fit_btn.setToolTip("复位视野")
             self._fit_btn.clicked.disconnect()
         except (RuntimeError, TypeError):        # pragma: no cover
             pass
@@ -189,6 +197,8 @@ class SliceView(pg.PlotWidget):
         self._full = (0, 0)       # 抽稀前的原始网格尺寸
         self._extent = (0.0, 1.0, 0.0, 1.0)
         self._press: QtCore.QPointF | None = None
+        self._ref_drag = False
+        self._ref_last_col: int | None = None
         self._ink = style.TEXT_DIM
         self._grid_on = True
         self._apply_style(grid=True)
@@ -335,12 +345,45 @@ class SliceView(pg.PlotWidget):
         except (RuntimeError, TypeError):        # pragma: no cover
             return False
 
+    def _line_pixel_x(self) -> float | None:
+        """绿线在控件坐标里的 x；线不可见时返回 None。"""
+        if not self._line.isVisible():
+            return None
+        vb = self.getViewBox()
+        y0 = vb.viewRange()[1][0]
+        scene = vb.mapViewToScene(QtCore.QPointF(self._line.getXPos(), y0))
+        return float(self.mapFromScene(scene).x())
+
+    def _on_reference_line(self, pos: QtCore.QPointF) -> bool:
+        x = self._line_pixel_x()
+        return x is not None and abs(pos.x() - x) <= 6.0
+
+    def keyPressEvent(self, ev) -> None:                # noqa: N802 （Qt 接口名）
+        if (ev.modifiers() == QtCore.Qt.KeyboardModifier.NoModifier
+                and ev.key() in (QtCore.Qt.Key.Key_Left, QtCore.Qt.Key.Key_Right)
+                and self._line.isVisible()):
+            self.traceStepped.emit(
+                -1 if ev.key() == QtCore.Qt.Key.Key_Left else 1)
+            ev.accept()
+            return
+        super().keyPressEvent(ev)
+
     def mouseMoveEvent(self, ev) -> None:
+        if self._ref_drag:
+            cell = self._to_cell(self.mapToView(ev.position()))
+            if cell is not None and cell[0] != self._ref_last_col:
+                self._ref_last_col = cell[0]
+                self.referenceDragged.emit(cell[0])
+            return
         super().mouseMoveEvent(ev)
         if self._on_plot_button(ev.position()):
             # 指针停在复位按钮上时没有“剖面坐标”可言，别让右上角读数停在按钮位置
             self.hover_left.emit()
+            self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
             return
+        self.setCursor(QtCore.Qt.CursorShape.SizeHorCursor
+                       if self._on_reference_line(ev.position())
+                       else QtCore.Qt.CursorShape.ArrowCursor)
         cell = self._to_cell(self.mapToView(ev.position()))
         if cell is not None:
             self.hovered.emit(cell[0], cell[1])
@@ -348,6 +391,13 @@ class SliceView(pg.PlotWidget):
     def mousePressEvent(self, ev) -> None:
         on_btn = self._on_plot_button(ev.position())
         is_left = ev.button() == QtCore.Qt.MouseButton.LeftButton
+        if (is_left and not on_btn and self._on_reference_line(ev.position())):
+            # 拖动绿线：不启动视野平移，也不要在松手时被当成一次取道
+            self._ref_drag = True
+            self._ref_last_col = None
+            self._press = None
+            self.setFocus()
+            return
         self._press = (ev.position()
                        if (is_left and self._shape[0] and not on_btn)
                        else None)
@@ -355,6 +405,8 @@ class SliceView(pg.PlotWidget):
             # 按钮可能还没因悬停而显示出来；这里主动复位一次，保证“按了就复位”，
             # 且绝不会被后面的 release 当成取道。
             self._fit_range()
+        if is_left:
+            self.setFocus()
         super().mousePressEvent(ev)            # 交给 ViewBox 做平移
 
     def mouseReleaseEvent(self, ev) -> None:
@@ -363,6 +415,13 @@ class SliceView(pg.PlotWidget):
         拖动是平移，若在按下时就取点，每次拖完都会顺手把下方单道波形换掉。
         按在复位按钮上的那次点击不算 —— 否则复位会顺手把绿线挪到左下角。
         """
+        if self._ref_drag:
+            cell = self._to_cell(self.mapToView(ev.position()))
+            self._ref_drag = False
+            self._ref_last_col = None
+            if cell is not None:
+                self.referenceDragged.emit(cell[0])
+            return
         pressed, self._press = self._press, None
         if (pressed is not None
                 and ev.button() == QtCore.Qt.MouseButton.LeftButton
@@ -511,9 +570,7 @@ class SlicePanel(QtWidgets.QFrame):
         if on:
             self.grab_handle.setPixmap(icons.swap(14, style.TEXT_MUTE))
             self.grab_handle.setToolTip("拖动 = 交换对比数据顺序")
-            self.header.setToolTip(
-                "拖动这一行 = 交换对比数据的左右顺序。\n"
-                "整块移动 / 拉出独立窗口 / 换分屏方式请拖上方「剖面」标题行。")
+            self.header.setToolTip("")
             self.header.setCursor(QtCore.Qt.CursorShape.OpenHandCursor)
         else:
             self.header.setToolTip("")
@@ -552,8 +609,8 @@ class SlicePanel(QtWidgets.QFrame):
 # 换成浅色主题时它们也会变白 —— 但导出图**不受主题影响**，永远是这一套。
 _FIG_BG = style.PAPER_BG
 _FIG_INK = style.PAPER_INK
-# 叠加图里每条曲线的图例名（按数据顺序）
-FIGURE_CODE_LABELS = ["数据 1", "数据 2", "数据 3", "数据 4"]
+# 叠加图里每条曲线的图例名（按数据顺序）。英文：期刊字体一般不保证中文字形。
+FIGURE_CODE_LABELS = ["Data 1", "Data 2", "Data 3", "Data 4"]
 
 
 def _pg_colormap(name: str) -> "pg.ColorMap":
@@ -567,37 +624,472 @@ def _pg_colormap(name: str) -> "pg.ColorMap":
     return pg.ColorMap(np.linspace(0.0, 1.0, len(lut)), lut[:, :3])
 
 
-def _figure_axes(plot: pg.PlotWidget, xlabel: str, ylabel: str) -> None:
+def _figure_background(options: ExportFigureOptions):
+    if options.transparent:
+        return QtGui.QColor(0, 0, 0, 0)
+    return QtGui.QColor(_FIG_BG)
+
+
+class _PaperAxis(pg.AxisItem):
+    """论文图坐标轴：轴标题与刻度数字之间额外留出一段距离。
+
+    pyqtgraph 默认把轴标题紧贴在刻度数字外侧（几乎零间距）。这里在
+    自动尺寸的基础上加一段固定留白，标题会继续贴在图幅外沿，中间的空隙
+    就是论文插图里常见的那个间隔。
+
+    ``force_edges=True`` 时，在轴的两端各补一个刻度（即使它不落在用户设定的
+    刻度间隔上）。自定义间隔（例如 80 m 一档、量程 900 m）最后会停在 880，
+    900 就既没有刻度线也没有数字；补上端点后两端的数值一定看得见。
+    """
+
+    def __init__(self, orientation: str, *args, label_gap: int = 0,
+                 force_edges: bool = False, **kwargs):
+        self._label_gap = max(0, int(label_gap))
+        self._force_edges = bool(force_edges)
+        super().__init__(orientation, *args, **kwargs)
+
+    def _updateHeight(self) -> None:
+        super()._updateHeight()
+        if (self.fixedHeight is None and self.label is not None
+                and self.label.isVisible()):
+            h = self.maximumHeight() + self._label_gap
+            self.setMaximumHeight(h)
+            self.setMinimumHeight(h)
+
+    def _updateWidth(self) -> None:
+        super()._updateWidth()
+        if (self.fixedWidth is None and self.label is not None
+                and self.label.isVisible()):
+            w = self.maximumWidth() + self._label_gap
+            self.setMaximumWidth(w)
+            self.setMinimumWidth(w)
+
+    def tickValues(self, minVal, maxVal, size):
+        """补上轴两端的刻度值；已经落在端点上的不重复添加。"""
+        levels = super().tickValues(minVal, maxVal, size)
+        if not self._force_edges or not levels:
+            return levels
+        lo, hi = sorted((float(minVal), float(maxVal)))
+        if hi <= lo:
+            return levels
+        spacing, values = levels[0]
+        eps = max(1e-9, (hi - lo) * 1e-6)
+        extra = [v for v in (lo, hi)
+                 if all(abs(v - float(x)) > eps for x in values)]
+        if not extra:
+            return levels
+        vals = sorted([float(x) for x in values] + extra)
+        vals = self._drop_crowded(vals, lo, hi, size, spacing)
+        levels = list(levels)
+        levels[0] = (spacing, vals)
+        return levels
+
+    def _drop_crowded(self, vals: list[float], lo: float, hi: float,
+                      size: float, spacing: float) -> list[float]:
+        """端点刻度挤到相邻刻度时，删掉相邻的那个，避免数字叠在一起。
+
+        是否挤在一起按实际字号量出来，而不是拍一个固定的比例：论文图里
+        数字比刻度间距还宽的情况并不少见。
+        """
+        if size <= 0 or len(vals) < 2:
+            return vals
+        slot = abs(size / (hi - lo))
+        font = self.style.get("tickFont") or QtGui.QFont()
+        metrics = QtGui.QFontMetricsF(font)
+
+        def extent(value: float) -> float:
+            try:
+                text = self.tickStrings(
+                    [value], self.autoSIPrefixScale * self.scale, spacing)[0]
+            except Exception:                    # pragma: no cover
+                return 0.0
+            if self.orientation in ("left", "right"):
+                return metrics.height()
+            return metrics.horizontalAdvance(text)
+
+        def pos(value: float) -> float:
+            return (value - lo) * slot
+
+        out = list(vals)
+        for edge, inner in ((out[-1], -2), (out[0], 1)):
+            while len(out) >= 2:
+                neighbor = out[inner]
+                if ((abs(neighbor - lo) <= abs(hi - lo) * 1e-6
+                     or abs(neighbor - hi) <= abs(hi - lo) * 1e-6)
+                        and neighbor != edge):
+                    break                        # 另一端也是端点：两个都保留
+                limit = (extent(edge) + extent(neighbor)) / 2.0 + 1.0
+                if abs(pos(edge) - pos(neighbor)) >= limit:
+                    break
+                out.pop(inner)
+        return out
+
+
+def _figure_plot(options: ExportFigureOptions, px_w: int,
+                 px_h: int) -> pg.PlotWidget:
+    """建一个论文图专用的 PlotWidget：四边坐标轴、只保留主刻度。"""
+    gap = max(4, int(round(1.5 / 25.4 * options.dpi)))
+    axes = {side: _PaperAxis(
+                side, label_gap=gap,
+                force_edges=(options.x_edge_ticks if side in ("bottom", "top")
+                             else options.y_edge_ticks))
+            for side in ("left", "right", "top", "bottom")}
+    plot = pg.PlotWidget(background=_figure_background(options), axisItems=axes)
+    plot.setMenuEnabled(False)
+    plot.resize(px_w, px_h)
+    _apply_figure_margins(plot, options)
+    for side in ("left", "bottom", "top", "right"):
+        plot.showAxis(side)
+        axis = plot.getAxis(side)
+        axis.setStyle(maxTickLevel=0, maxTextLevel=0)
+        axis.setZValue(10)                     # 刻度压在图上面，内刻度才看得见
+    return plot
+
+
+def _figure_font(options: ExportFigureOptions, out_fmt: str) -> QtGui.QFont:
+    """PNG / SVG 都用像素字号。
+
+    SVG 的用户单位就是场景像素（根节点 viewBox = 目标像素尺寸），
+    用磅值会被 QSvgGenerator 再按屏幕 DPI 换算一次，物理字号缩到约 1/3。
+    这里统一按 ``font_px``（= pt × DPI / 72）给，落到毫米上才是真正的 font_pt。
+    """
+    font = QtGui.QFont(options.font_family)
+    font.setPixelSize(options.font_px())
+    return font
+
+
+def _figure_css_size(options: ExportFigureOptions, out_fmt: str) -> str:
+    """坐标轴标题 / 图例 / 图标题用的字号（场景像素，PNG 与 SVG 同一口径）。"""
+    return f"{options.font_px()}px"
+
+
+def _figure_title_args(options: ExportFigureOptions, out_fmt: str) -> dict:
+    return {"color": _FIG_INK, "family": options.font_family,
+            "size": _figure_css_size(options, out_fmt)}
+
+
+def _figure_label_args(options: ExportFigureOptions, out_fmt: str) -> dict:
+    """AxisItem 的标签走 CSS，键名必须是带连字符的 CSS 属性名。"""
+    return {"color": _FIG_INK, "font-family": options.font_family,
+            "font-size": _figure_css_size(options, out_fmt)}
+
+
+def apply_figure_typography(plot,
+                            options: ExportFigureOptions,
+                            out_fmt: str = "png") -> None:
+    """把字体族与字号应用到坐标轴刻度与图例。
+
+    轴标题与图标题由 ``setLabel`` / ``setTitle`` 的 CSS 参数直接设定 ——
+    ``LabelItem`` 内部是一个独立的 ``QGraphicsTextItem``，调用 ``setFont``
+    并不会改到它，必须走 HTML 的 ``font-size`` / ``font-family``。
+    """
+    font = _figure_font(options, out_fmt)
+    item = plot.getPlotItem() if hasattr(plot, "getPlotItem") else plot
+    for side in ("bottom", "left", "right", "top"):
+        try:
+            item.getAxis(side).setStyle(tickFont=font)
+        except Exception:                        # pragma: no cover
+            pass
+    try:
+        legend = item.legend
+        if legend is not None:
+            size = _figure_css_size(options, out_fmt)
+            # pyqtgraph 的 setLabelTextSize 只改 opts、不重排已有文字，
+            # 这里逐条重设一遍，保证图例字号真的变了。
+            for _sample, label in legend.items:
+                try:
+                    label.setText(label.text, size=size, color=_FIG_INK)
+                except Exception:                # pragma: no cover
+                    pass
+    except Exception:                            # pragma: no cover
+        pass
+
+
+_MAX_EXPLICIT_TICKS = 300
+
+
+def _explicit_tick(step: float, span: float | None) -> float:
+    """自定义主刻度间隔；过密（超过 ``_MAX_EXPLICIT_TICKS`` 格）回退自动刻度。
+
+    间隔为 0 / 非法或轴跨度未知时也返回 0（= 交给 pyqtgraph 自动算）。
+    """
+    try:
+        step = float(step or 0.0)
+        span = abs(float(span)) if span is not None else 0.0
+    except (TypeError, ValueError):              # pragma: no cover
+        return 0.0
+    if step <= 0 or span <= 0:
+        return 0.0
+    return step if span / step <= _MAX_EXPLICIT_TICKS else 0.0
+
+
+def _figure_axes(plot: pg.PlotWidget, xlabel: str, ylabel: str,
+                 options: ExportFigureOptions | None = None,
+                 out_fmt: str = "png",
+                 x_span: float | None = None,
+                 y_span: float | None = None) -> None:
     """白底图的坐标轴：文字与刻度一律深色（**不看界面主题**，导出图固定论文白底）。
 
     同时关掉 pyqtgraph 的自动 SI 前缀 —— 否则会把 0.002 s 显示成「2 (x0.001)」，
     论文图里读者还得自己做乘法，不如直接给带单位的原始数值。
+
+    轴线与刻度线按 DPI 换算成真实线宽 / 长度：pyqtgraph 默认 1 px，
+    在 300 DPI 的 180 mm 图里只有 0.085 mm，缩到预览尺寸就完全看不见了。
+
+    ``x_span`` / ``y_span`` 是轴的数值跨度，只用于判断用户的自定义刻度间隔
+    会不会画出几百条刻度线；间隔过密时回退自动刻度。
     """
-    plot.setLabel("bottom", xlabel, color=_FIG_INK)
-    plot.setLabel("left", ylabel, color=_FIG_INK)
-    for side in ("bottom", "left"):
+    opt = options or ExportFigureOptions()
+    args = _figure_label_args(opt, out_fmt)
+    plot.setLabel(opt.xlabel_side, xlabel, **args)
+    plot.setLabel(opt.ylabel_side, ylabel, **args)
+    axis_pen = pg.mkPen(_FIG_INK, width=max(1.0, opt.line_width_px()))
+    raw_len = max(4, int(round(1.2 / 25.4 * opt.dpi)))
+    tick_len = -raw_len if opt.ticks_inside else raw_len
+    tick_gap = max(3, int(round(1.2 / 25.4 * opt.dpi)))
+    # 端点（0 / 最大值）的标签会探出坐标轴矩形；容差必须够大，否则 pyqtgraph
+    # 会直接把探出过多的数字丢掉。真正的“别被图幅裁掉”由
+    # ``_fit_tick_labels`` 在图幅内补足留白解决，这里只负责让标签先画出来。
+    allow = max(16, int(round(opt.font_px() * 3.0)))
+    number_sides = (opt.x_numbers_side, opt.y_numbers_side)
+    x_tick = _explicit_tick(opt.x_tick_major, x_span)
+    y_tick = _explicit_tick(opt.y_tick_major, y_span)
+    # pyqtgraph 的 setTitle 把标题行高写死为 30 px；14 pt @300 DPI 有 58 px，
+    # 不放开就会把标题上半截裁掉。这里按字号给足行高。
+    title_label = plot.getPlotItem().titleLabel
+    if title_label.text and title_label.isVisible():
+        title_label.setMaximumHeight(
+            max(30, int(round(opt.font_px() * 1.6))))
+    for side in ("bottom", "left", "top", "right"):
         try:
             axis = plot.getAxis(side)
             axis.setTextPen(pg.mkPen(_FIG_INK))
-            axis.setPen(pg.mkPen(_FIG_INK))
+            axis.setPen(axis_pen)
+            axis.setStyle(tickLength=tick_len, tickTextOffset=tick_gap,
+                          maxTickLevel=0, maxTextLevel=0,
+                          showValues=side in number_sides,
+                          hideOverlappingLabels=allow)
             axis.enableAutoSIPrefix(False)
+            # 只给一个 level：没有次刻度，只画用户指定的主刻度。
+            # 注意不能写成 setTickSpacing(major=…, minor=None) —— 那会生成
+            # 一个 spacing=None 的层级，pyqtgraph 计算刻度值时直接报错。
+            step = x_tick if side in ("bottom", "top") else y_tick
+            if step > 0:
+                axis.setTickSpacing(levels=[(step, 0.0)])
         except Exception:                        # pragma: no cover
             pass
+    apply_figure_typography(plot, opt, out_fmt)
+
+
+def _colorbar_gap(options: ExportFigureOptions) -> int:
+    """绘图区与色标条之间的留白（约 2.5 mm，按 DPI 换算成像素）。"""
+    return max(8, int(round(2.5 / 25.4 * options.dpi)))
+
+
+def _style_colorbar(cbar: pg.ColorBarItem, label_text: str,
+                    options: ExportFigureOptions, out_fmt: str) -> None:
+    """给色标条补上正确的字号与标签样式。"""
+    args = _figure_label_args(options, out_fmt)
+    side = "bottom" if cbar.horizontal else "left"
+    try:
+        if label_text:
+            cbar.getAxis(side).setLabel(label_text, **args)
+        raw_len = max(4, int(round(1.2 / 25.4 * options.dpi)))
+        cbar.axis.setStyle(
+            tickFont=_figure_font(options, out_fmt),
+            tickLength=-raw_len if options.ticks_inside else raw_len,
+            tickTextOffset=max(3, int(round(0.8 / 25.4 * options.dpi))),
+            maxTickLevel=0, maxTextLevel=0)
+        # 色标刻度也用原始数值：否则 -0.8 会被显示成 -800 再加一个 (x0.001)。
+        # pyqtgraph 的 enableAutoSIPrefix(False) 不会把已缓存的缩放清回 1，
+        # 这里连缓存一起复位。
+        cbar.axis.enableAutoSIPrefix(False)
+        cbar.axis.autoSIPrefixScale = 1.0
+        cbar.axis.picture = None
+        cbar.axis.update()
+        axis_pen = pg.mkPen(_FIG_INK, width=max(1.0, options.line_width_px()))
+        for side in ("left", "right", "top", "bottom"):
+            axis = cbar.getAxis(side)
+            axis.setPen(axis_pen)
+            axis.setTextPen(pg.mkPen(_FIG_INK))
+        if not cbar.horizontal:
+            cbar.axis.setWidth(max(45, options.font_px() * 4))
+    except Exception:                            # pragma: no cover
+        pass
+
+
+def _reserve_figure_width(plot: pg.PlotWidget, width: int) -> None:
+    """在图幅右侧留一段固定宽度的空白（色标在底部时用来保持绘图区宽高比）。"""
+    if width <= 2:
+        return
+    try:
+        lay = plot.getPlotItem().layout
+        spacer = QtWidgets.QGraphicsWidget()
+        spacer.setMinimumSize(QtCore.QSizeF(width, 0.0))
+        spacer.setMaximumSize(QtCore.QSizeF(width, 0.0))
+        lay.addItem(spacer, 2, 6)
+        lay.activate()
+        _refresh_plot_matrices(plot)
+    except Exception:                            # pragma: no cover
+        pass
+
+
+def _keep_bottom_colorbar_aspect(plot: pg.PlotWidget) -> None:
+    """色标条在底部时，按「没有色标」时的绘图区宽高比收窄绘图区。
+
+    底部色标只会吃掉绘图区高度；若宽度仍铺满，剖面会比无色标时更宽扁。
+    这里先让布局按最终尺寸落定，再算出多出来的那截宽度，留到图幅右侧：
+    绘图区保持原有比例，色标条也自动与绘图区等宽。
+    """
+    try:
+        _show_offscreen(plot)
+        pi = plot.getPlotItem()
+        vb = pi.getViewBox()
+        width, height = pi.size().width(), pi.size().height()
+        lm, tm, rm, bm = pi.layout.getContentsMargins()
+        left = pi.getAxis("left").geometry().width()
+        right = pi.getAxis("right").geometry().width()
+        content_w = max(1.0, width - lm - rm)
+        content_h = max(1.0, height - tm - bm)
+        full_w = max(1.0, content_w - left - right)
+        # 顶部（标题 / 上轴）与下方横轴仍然存在，只是底部色标额外多占了一段；
+        # 用「横轴顶边 - 绘图区顶边」还原没有色标时绘图区应有的高度。
+        top_used = vb.geometry().top() - tm
+        bottom_axis = pi.getAxis("bottom").geometry().height()
+        full_h = max(1.0, content_h - top_used - bottom_axis)
+        vb_h = vb.geometry().height()
+        reserve = full_w * (1.0 - min(1.0, vb_h / full_h))
+        _reserve_figure_width(plot, int(round(reserve)))
+    except Exception:                            # pragma: no cover
+        pass
+
+
+def _refresh_plot_matrices(plot: pg.PlotWidget) -> None:
+    """布局尺寸变化后立刻重算绘图区（含色标条）的坐标变换。
+
+    只调 ``layout.activate()`` 是不够的：PNG 导出要等到下一次绘制才刷新，
+    SVG 导出则直接读到旧变换，图像与色条会伸出绘图区。
+    """
+    pi = plot.getPlotItem()
+    pi.getViewBox().updateMatrix()
+    for pos in ((5, 1), (2, 5)):
+        try:
+            cbar = pi.layout.itemAt(*pos)
+        except Exception:                        # pragma: no cover
+            cbar = None
+        if isinstance(cbar, pg.PlotItem):
+            cbar.getViewBox().updateMatrix()
+
+
+def _tick_label_overflows(plot: pg.PlotWidget) -> tuple[float, float, float, float]:
+    """算出刻度数字探出图幅四边各多少像素（左、上、右、下）。"""
+    pi = plot.getPlotItem()
+    width, height = pi.size().width(), pi.size().height()
+    over = [0.0, 0.0, 0.0, 0.0]
+    picture = QtGui.QPicture()
+    painter = QtGui.QPainter(picture)
+    try:
+        for side in ("left", "right", "top", "bottom"):
+            try:
+                axis = pi.getAxis(side)
+                if not axis.isVisible() or not axis.style.get("showValues"):
+                    continue
+                specs = axis.generateDrawSpecs(painter)
+                if not specs:
+                    continue
+                for rect, _flags, _text in specs[2]:
+                    mapped = axis.mapRectToParent(rect)
+                    over[0] = max(over[0], -mapped.left())
+                    over[1] = max(over[1], -mapped.top())
+                    over[2] = max(over[2], mapped.right() - width)
+                    over[3] = max(over[3], mapped.bottom() - height)
+            except Exception:                    # pragma: no cover
+                continue
+    finally:
+        painter.end()
+    return tuple(max(0.0, v) for v in over)
+
+
+def _fit_tick_labels(plot: pg.PlotWidget,
+                     options: ExportFigureOptions) -> None:
+    """把探出图幅的刻度数字留在图内：扩大对应一侧的内部留白。
+
+    **不移动刻度数字**（否则数字与刻度线对不上）。做法是把图幅外框不变、
+    绘图区往里收一点，让原本落在图幅外的数字正好落进新增的留白里。
+    整幅导出尺寸仍是用户设定的物理尺寸，只是绘图区略窄/略矮。
+    """
+    try:
+        _show_offscreen(plot)
+        left, top, right, bottom = _tick_label_overflows(plot)
+        if max(left, top, right, bottom) <= 0.5:
+            return
+        pad = max(2.0, round(0.5 / 25.4 * options.dpi))
+        lay = plot.getPlotItem().layout
+        lm, tm, rm, bm = lay.getContentsMargins()
+        lay.setContentsMargins(
+            lm + (left + pad if left > 0.5 else 0.0),
+            tm + (top + pad if top > 0.5 else 0.0),
+            rm + (right + pad if right > 0.5 else 0.0),
+            bm + (bottom + pad if bottom > 0.5 else 0.0))
+        lay.activate()
+        _refresh_plot_matrices(plot)
+    except Exception:                            # pragma: no cover
+        pass
+
+
+def _figure_size(options: ExportFigureOptions, size) -> tuple[int, int]:
+    if size is not None:
+        return (max(1, int(size[0])), max(1, int(size[1])))
+    return options.pixel_size()
+
+
+def _figure_margin(options: ExportFigureOptions) -> int:
+    """图幅四周的留白（约 2 mm）：期刊排版时图不会顶到版心边缘。"""
+    return max(4, int(round(2.0 / 25.4 * options.dpi)))
+
+
+def _apply_figure_margins(plot: pg.PlotWidget,
+                          options: ExportFigureOptions) -> None:
+    try:
+        m = _figure_margin(options)
+        plot.getPlotItem().layout.setContentsMargins(m, m, m, m)
+    except Exception:                            # pragma: no cover
+        pass
+
+
+def _set_export_range(vb: "pg.ViewBox", x0: float, x1: float,
+                      y0: float, y1: float) -> None:
+    """把视野钉到数据范围上，并向两端各让一丝（约 1e-9 相对量）。
+
+    pyqtgraph 从视图反算坐标时会引入 1e-17 量级的浮点误差：范围下限变成
+    ``6.9e-17`` 而不是 0，刻度起点用 ``ceil`` 一取整就跳到了下一个刻度，
+    于是“0”这个刻度整个消失。这里把范围向外扩一个肉眼不可见的量，
+    保证 0 落在范围内部、刻度能正常生成。
+    """
+    ex = max(1e-9, abs(x1 - x0) * 1e-9)
+    ey = max(1e-9, abs(y1 - y0) * 1e-9)
+    vb.setLimits(xMin=x0 - ex, xMax=x1 + ex, yMin=y0 - ey, yMax=y1 + ey)
+    vb.disableAutoRange()
+    vb.setRange(rect=QtCore.QRectF(x0 - ex, y0 - ey,
+                                   (x1 - x0) + 2 * ex, (y1 - y0) + 2 * ey),
+                padding=0.0)
 
 
 def build_slice_figure(img: np.ndarray, extent: tuple[float, float, float, float],
                        cmap: str, clim: tuple[float, float],
                        xlabel: str, ylabel: str, invert_y: bool = True,
-                       colorbar_label: str = "振幅", size=(1000, 760),
-                       grid: bool = False) -> pg.PlotWidget:
-    """离屏构建一张剖面图（白底、物理坐标轴、带色条）。
+                       colorbar_label: str = "Amplitude", size=None,
+                       grid: bool = False,
+                       options: ExportFigureOptions | None = None,
+                       out_fmt: str = "png", title: str = "") -> pg.PlotWidget:
+    """离屏构建一张剖面图（白底、物理坐标轴、可选色条）。
 
-    ``img`` 的行是纵轴、列是横轴，与 ``extent`` 一一对应。
-    默认**不画网格** —— 地震剖面图里网格只会盖在同相轴上，论文用图不需要。
+    ``title`` 由用户输入，留空就不画标题；剖面序号 / 目标道号只在设置面板里显示，
+    不画进图里。
     """
-    plot = pg.PlotWidget(background=_FIG_BG)
-    plot.setMenuEnabled(False)
-    plot.resize(int(size[0]), int(size[1]))
+    opt = options or ExportFigureOptions()
+    px_w, px_h = _figure_size(opt, size)
+    plot = _figure_plot(opt, px_w, px_h)
     if grid:
         plot.showGrid(x=True, y=True, alpha=0.22)
     vb = plot.getViewBox()
@@ -605,33 +1097,57 @@ def build_slice_figure(img: np.ndarray, extent: tuple[float, float, float, float
     vb.invertY(bool(invert_y))
 
     item = pg.ImageItem(axisOrder="row-major", autoDownsample=False)
-    # 坏点在白底图上要填成白色，否则会变成一块块暗斑
-    item.setImage(render.to_rgba(img, cmap, clim, missing_color=(255, 255, 255, 255)),
+    missing = (0, 0, 0, 0) if opt.transparent else (255, 255, 255, 255)
+    item.setImage(render.to_rgba(img, cmap, clim, missing_color=missing),
                   autoLevels=False, levels=None)
     x0, x1, y0, y1 = (float(v) for v in extent)
     item.setRect(QtCore.QRectF(x0, y0, x1 - x0, y1 - y0))
     plot.addItem(item)
-    _figure_axes(plot, xlabel, ylabel)
+    if title:
+        plot.setTitle(title, **_figure_title_args(opt, out_fmt))
+    _figure_axes(plot, xlabel, ylabel, opt, out_fmt,
+                 x_span=x1 - x0, y_span=y1 - y0)
 
-    lo, hi = float(clim[0]), float(clim[1])
-    try:
-        cbar = pg.ColorBarItem(values=(lo, hi), colorMap=_pg_colormap(cmap),
-                               label=colorbar_label, interactive=False, width=14)
-        # 只把它插到右侧布局，**不要**调 setImageItem 把图像托管给色条 ——
-        # ColorBarItem 会把 values 写回 ImageItem.levels，而这里塞进去的已经是
-        # 上过色的 RGBA，再被 levels 处理一遍等于"给颜色再上一次色"，结果几乎
-        # 所有样点被推到纯白：导出图看起来"没有噪声、比屏幕干净"。
-        # 色条自己的渐变来自 colorMap、刻度来自 values，根本不需要托管图像。
-        lay = plot.getPlotItem().layout
-        lay.addItem(cbar, 2, 5)
-        lay.setColumnFixedWidth(4, 5)
-    except Exception:                            # pragma: no cover
-        pass                                    # 色条只是锦上添花，失败不影响出图
+    if opt.colorbar:
+        lo, hi = float(clim[0]), float(clim[1])
+        bar_w = max(14, int(round(px_w * 0.022)))
+        gap = _colorbar_gap(opt)
+        try:
+            cbar = pg.ColorBarItem(
+                values=(lo, hi), colorMap=_pg_colormap(cmap),
+                label=None, interactive=False, width=bar_w,
+                orientation=("horizontal" if opt.colorbar_pos == "bottom"
+                             else "vertical"))
+            # 只把色条插到布局里，**不要** setImageItem：图像已是 RGBA。
+            # 间距用"空列 / 空行"的固定尺寸实现（pyqtgraph 自己的插法）；
+            # 否则关掉色标文字后色条会直接贴住图像。
+            lay = plot.getPlotItem().layout
+            if opt.colorbar_pos == "bottom":
+                lay.addItem(cbar, 5, 1)          # 底部坐标轴下面两行
+                lay.setRowFixedHeight(4, gap)
+            else:
+                lay.addItem(cbar, 2, 5)          # 右轴右侧
+                lay.setColumnFixedWidth(4, gap)
+            _style_colorbar(cbar, colorbar_label if opt.colorbar_label else "",
+                            opt, out_fmt)
+            if opt.colorbar_pos == "bottom":
+                # 按色标自身的尺寸提示补足行高：14 pt 时 pyqtgraph 会把
+                # 轴标题只按 0.8 倍高度计入，底部一截会伸出图片。
+                hint_h = int(round(
+                    cbar.sizeHint(QtCore.Qt.SizeHint.PreferredSize).height()))
+                extra = int(round(opt.font_px() * 0.4)) + 8
+                lay.setRowFixedHeight(5, max(bar_w + opt.font_px() + 12,
+                                             hint_h + extra))
+        except Exception:                        # pragma: no cover
+            pass                                 # 色条失败不影响出图
     assert item.levels is None, "ImageItem 不应被写入 levels（否则导出会洗白）"
 
-    vb.setLimits(xMin=x0, xMax=x1, yMin=y0, yMax=y1)
-    vb.disableAutoRange()
-    vb.setRange(rect=QtCore.QRectF(x0, y0, x1 - x0, y1 - y0), padding=0.01)
+    _set_export_range(vb, x0, x1, y0, y1)
+    # 先给刻度数字留足图内空间，再按（同样留白下的）无色标比例收窄绘图区，
+    # 这样有色标 / 无色标两种出图的剖面比例一致。
+    _fit_tick_labels(plot, opt)
+    if opt.colorbar and opt.colorbar_pos == "bottom":
+        _keep_bottom_colorbar_aspect(plot)
     return plot
 
 
@@ -640,110 +1156,189 @@ def build_wiggle_figure(img: np.ndarray, extent: tuple[float, float, float, floa
                         n_traces: int = 60, gain: float = 1.0,
                         invert_y: bool = True,
                         labels: list[str] | None = None,
-                        size=(1000, 760)) -> pg.PlotWidget:
-    """离屏构建一张"只有 wiggle 曲线"的图（白纸、无网格、无密度图）。
-
-    ``sets`` = ``[(切片, 色标, 幅度缩放, (颜色, 线型)), ...]``；多组就把多份数据的
-    波形叠在同一张图上（对比模式），并给出每份数据一条图例。
-    ``labels`` 是图例文字（与单道波形导出图用同一套写法，见 main_window
-    ``_dataset_label``）；省略时退回"数据 1 / 数据 2"。
-    """
-    plot = pg.PlotWidget(background=_FIG_BG)
-    plot.setMenuEnabled(False)
-    plot.resize(int(size[0]), int(size[1]))
+                        size=None,
+                        options: ExportFigureOptions | None = None,
+                        out_fmt: str = "png", title: str = "") -> pg.PlotWidget:
+    """离屏构建一张"只有 wiggle 曲线"的图（白纸、无网格、无密度图）。"""
+    opt = options or ExportFigureOptions()
+    px_w, px_h = _figure_size(opt, size)
+    plot = _figure_plot(opt, px_w, px_h)
     vb = plot.getViewBox()
     vb.setDefaultPadding(0.01)
     vb.invertY(bool(invert_y))
 
     legend = None
-    if len(sets) > 1:
+    if opt.legend and len(sets) > 1:
         try:
-            legend = plot.addLegend(offset=(-14, 12), brush=pg.mkBrush(255, 255, 255, 215),
-                                    pen=pg.mkPen("#BBBBBB"), labelTextColor=_FIG_INK)
+            legend = plot.addLegend(
+                offset=(-14, 12), brush=pg.mkBrush(255, 255, 255, 215),
+                pen=pg.mkPen("#BBBBBB"), labelTextColor=_FIG_INK,
+                labelTextSize=_figure_css_size(opt, out_fmt))
         except Exception:                        # pragma: no cover
             legend = None
+    width = opt.line_width_px()          # 场景像素：SVG 的用户单位也是场景像素
     for i, (src_img, clim, scale, style_pair) in enumerate(sets):
-        pen = line_pen(style_pair, 1.0)
+        pen = line_pen(style_pair, width)
         for xs, ys in render.wiggle_curves(src_img, extent, clim, n_traces, gain, scale):
             plot.plot(xs, ys, pen=pen)
         if legend is not None:
             # 图例只登记一条代理线，而不是给几十条曲线各写一行
-            legend.addItem(pg.PlotDataItem([], [], pen=line_pen(style_pair, 1.8)),
+            legend.addItem(pg.PlotDataItem([], [], pen=line_pen(style_pair, width * 1.8)),
                            (labels[i] if labels and i < len(labels)
                             else FIGURE_CODE_LABELS[i % len(FIGURE_CODE_LABELS)]))
 
     x0, x1, y0, y1 = (float(v) for v in extent)
     plot.addItem(pg.InfiniteLine(pos=0.0, angle=0, movable=False,
-                                 pen=pg.mkPen("#999999", width=1)),
+                                 pen=pg.mkPen("#999999",
+                                              width=max(1.0, opt.line_width_px() * 0.6))),
                  ignoreBounds=True)
-    _figure_axes(plot, xlabel, ylabel)
-    vb.setLimits(xMin=x0, xMax=x1, yMin=y0, yMax=y1)
-    vb.disableAutoRange()
-    vb.setRange(rect=QtCore.QRectF(x0, y0, x1 - x0, y1 - y0), padding=0.01)
+    if title:
+        plot.setTitle(title, **_figure_title_args(opt, out_fmt))
+    _figure_axes(plot, xlabel, ylabel, opt, out_fmt,
+                 x_span=x1 - x0, y_span=y1 - y0)
+    _set_export_range(vb, x0, x1, y0, y1)
+    _fit_tick_labels(plot, opt)
     return plot
 
 
-def build_trace_figure(entries: list, xlabel: str = "时间 T (s)",
-                       ylabel: str = "振幅", size=(1000, 520)) -> pg.PlotWidget:
-    """离屏构建一张单道波形图。
+def _trace_bounds(entries: list, x_range: tuple[float, float] | None):
+    """按（可选）时间窗口算出波形图的 x / y 范围，y 留 6% 余量。"""
+    arrays = [(np.asarray(t, dtype=float), np.asarray(a, dtype=float))
+              for t, a, *_ in entries]
+    arrays = [(t, a) for t, a in arrays if t.size and a.size]
+    if not arrays:
+        return None
+    t_min = min(float(t.min()) for t, _ in arrays)
+    t_max = max(float(t.max()) for t, _ in arrays)
+    lo, hi = t_min, t_max
+    if x_range is not None:
+        try:
+            a, b = (float(v) for v in x_range)
+            lo, hi = max(t_min, min(a, b)), min(t_max, max(a, b))
+        except (TypeError, ValueError):          # pragma: no cover
+            lo, hi = t_min, t_max
+        if not (hi > lo):
+            lo, hi = t_min, t_max
+    vals = [a[(t >= lo) & (t <= hi) & np.isfinite(a)] for t, a in arrays]
+    vals = [v for v in vals if v.size]
+    if not vals:
+        y0, y1 = -1.0, 1.0
+    else:
+        y0 = min(float(np.min(v)) for v in vals)
+        y1 = max(float(np.max(v)) for v in vals)
+    pad = (y1 - y0) * 0.06 or 1.0
+    return lo, hi, y0 - pad, y1 + pad
 
-    ``entries`` = ``[(时间, 振幅, (颜色, 线型), 曲线名), ...]``；不画网格，
-    和导出的剖面对齐成同一套"论文用图"风格。
-    """
-    plot = pg.PlotWidget(background=_FIG_BG)
-    plot.setMenuEnabled(False)
-    plot.resize(int(size[0]), int(size[1]))
+
+def build_trace_figure(entries: list, xlabel: str = "Time T (s)",
+                       ylabel: str = "Amplitude", size=None,
+                       options: ExportFigureOptions | None = None,
+                       out_fmt: str = "png", title: str = "",
+                       x_range: tuple[float, float] | None = None) -> pg.PlotWidget:
+    """离屏构建一张单道波形图；``x_range`` 选定只导出哪一段（秒）。"""
+    opt = options or ExportFigureOptions()
+    px_w, px_h = _figure_size(opt, size)
+    plot = _figure_plot(opt, px_w, px_h)
     plot.getViewBox().setDefaultPadding(0.02)
     # 图例必须在画曲线**之前**建：pyqtgraph 的图例只登记之后通过 plot(name=…)
     # 加进来的条目，反过来建就会得到一个空白的图例框。
-    if len(entries) > 1:
+    if opt.legend and len(entries) > 1:
         try:
-            plot.addLegend(offset=(-14, 12), brush=pg.mkBrush(255, 255, 255, 215),
-                           pen=pg.mkPen("#BBBBBB"), labelTextColor=_FIG_INK)
+            plot.addLegend(
+                offset=(-14, 12), brush=pg.mkBrush(255, 255, 255, 215),
+                pen=pg.mkPen("#BBBBBB"), labelTextColor=_FIG_INK,
+                labelTextSize=_figure_css_size(opt, out_fmt))
         except Exception:                        # pragma: no cover
             pass
+    width = opt.line_width_px()          # 场景像素：SVG 的用户单位也是场景像素
     for t, amp, style_pair, name in entries:
-        plot.plot(t, amp, pen=line_pen(style_pair, 1.6), name=name)
+        plot.plot(t, amp, pen=line_pen(style_pair, width), name=name)
     plot.addItem(pg.InfiniteLine(pos=0.0, angle=0, movable=False,
-                                 pen=pg.mkPen("#999999", width=1)),
+                                 pen=pg.mkPen("#999999",
+                                              width=max(1.0, opt.line_width_px() * 0.6))),
                  ignoreBounds=True)
-    _figure_axes(plot, xlabel, ylabel)
-    plot.enableAutoRange()
+    if title:
+        plot.setTitle(title, **_figure_title_args(opt, out_fmt))
+    bounds = _trace_bounds(entries, x_range)
+    _figure_axes(plot, xlabel, ylabel, opt, out_fmt,
+                 x_span=(bounds[1] - bounds[0]) if bounds else None,
+                 y_span=(bounds[3] - bounds[2]) if bounds else None)
+
+    if bounds is not None:
+        _set_export_range(plot.getViewBox(), *bounds)
+    else:
+        plot.enableAutoRange()
+    _fit_tick_labels(plot, opt)
     return plot
 
 
+def _show_offscreen(plot: pg.PlotWidget) -> None:
+    if plot.isVisible():
+        return
+    plot.setAttribute(QtCore.Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    plot.show()
+    QtWidgets.QApplication.processEvents()
+
+
+def _image_exporter(plot: pg.PlotWidget, options: ExportFigureOptions):
+    from pyqtgraph.exporters import ImageExporter
+    exporter = ImageExporter(plot.getPlotItem())
+    params = exporter.parameters()
+    params["antialias"] = True
+    bg = _figure_background(options)
+    if options.transparent:
+        bg.setAlpha(0)
+    params["background"] = bg
+    px_w, px_h = options.pixel_size()
+    params["width"] = px_w
+    params["height"] = px_h
+    return exporter
+
+
+def render_figure_image(plot: pg.PlotWidget,
+                        options: ExportFigureOptions | None = None) -> QtGui.QImage:
+    """把图渲染成 QImage（预览用，不落盘）。"""
+    opt = options or ExportFigureOptions()
+    _show_offscreen(plot)
+    return _image_exporter(plot, opt).export(toBytes=True)
+
+
 def export_figure(plot: pg.PlotWidget, path: str, fmt: str,
-                  width: int | None = None) -> str:
-    """把上面构建的图写出 PNG / SVG（走 pyqtgraph 自带的导出器）。
-
-    用 ``ImageExporter`` / ``SVGExporter`` 而不是截屏：导出器按图元的包围盒重新
-    渲染，PNG 是白底的干净位图，SVG 是真正的矢量（坐标轴、文字都可缩放）。
-
-    **必须先让控件"走完一次显示流程"**：控件从没 show 过时，场景里的文字还没被
-    解析，导出会得到满屏"口口口"方框（若干次试出来的）。这里用
-    ``WA_DontShowOnScreen`` 让它完成 show / 布局 / 绘制，但不会真的弹到屏幕上。
-
-    **格式由参数决定、不看扩展名**：``ImageExporter`` 默认按文件后缀推断格式，
-    后缀不认识（例如把 PNG 存成 ``.svg``）时它会静默不写文件 —— 所以这里拿到
-    QImage 后自己用 "PNG" 保存，并在最后确认文件确实落盘。
-    """
-    from pyqtgraph.exporters import ImageExporter, SVGExporter
-    if not plot.isVisible():
-        plot.setAttribute(QtCore.Qt.WidgetAttribute.WA_DontShowOnScreen, True)
-        plot.show()
-        QtWidgets.QApplication.processEvents()
-
+                  options: ExportFigureOptions | None = None) -> str:
+    """把构建好的图写出 PNG / SVG（物理尺寸、DPI、透明背景、字体已生效）。"""
+    opt = options or ExportFigureOptions()
+    _show_offscreen(plot)
     out = str(path)
     fmt = str(fmt).lower()
     if fmt == "svg":
-        SVGExporter(plot.getPlotItem()).export(out)
-    elif fmt == "png":
-        exporter = ImageExporter(plot.getPlotItem())
+        from pyqtgraph.exporters import SVGExporter
+        exporter = SVGExporter(plot.getPlotItem())
         params = exporter.parameters()
-        params["antialias"] = True
-        if width:
-            params["width"] = int(width)
-        image = exporter.export(toBytes=True)
+        px_w, px_h = opt.pixel_size()
+        params["width"] = px_w
+        params["height"] = px_h
+        bg = _figure_background(opt)
+        if opt.transparent:
+            bg.setAlpha(0)
+        params["background"] = bg
+        xml = exporter.export(toBytes=True).decode("utf-8")
+        # pyqtgraph 的 SVG 根节点通常只有 viewBox，没有 width/height；
+        # 补上物理毫米尺寸，再交给排版软件时才是 1:1 的实际大小。
+        match = re.search(r"<svg\b[^>]*>", xml)
+        if match is not None:
+            tag = match.group(0)
+            tag = re.sub(r'\swidth="[^"]*"', "", tag)
+            tag = re.sub(r'\sheight="[^"]*"', "", tag)
+            tag = (tag[:-1]
+                   + f' width="{opt.width_mm:g}mm"'
+                   + f' height="{opt.height_mm:g}mm">')
+            xml = xml[:match.start()] + tag + xml[match.end():]
+        Path(out).write_text(xml, "utf-8")
+    elif fmt == "png":
+        image = _image_exporter(plot, opt).export(toBytes=True)
+        dots = max(1, round(opt.dpi / 0.0254))
+        image.setDotsPerMeterX(dots)
+        image.setDotsPerMeterY(dots)
         if not image.save(out, "PNG"):
             raise RuntimeError(f"写不出 PNG：{out}")
     else:

@@ -1,0 +1,53 @@
+{
+  "data": {
+    "active": 0,
+    "base_clims": 0,
+    "clims": [],
+    "content_shown": {
+      "right": false,
+      "slice": true,
+      "trace": false
+    },
+    "datasets": [],
+    "layout_preset": "B",
+    "pair_order": [
+      "slice"
+    ],
+    "panels": 0,
+    "user_size": null
+  },
+  "widgets": {
+    "agc": false,
+    "agc_window": 0,
+    "clim_mode": "auto",
+    "cmap": "seismic",
+    "contrast": 100,
+    "decimation": 2048,
+    "ds": 25.0,
+    "dt": 0.001,
+    "dx": 12.5,
+    "gain": 100,
+    "line_styles": [
+      [
+        "#111827",
+        "solid"
+      ],
+      [
+        "#D62828",
+        "solid"
+      ],
+      [
+        "#1D4ED8",
+        "dash"
+      ]
+    ],
+    "loop": true,
+    "manual": 1.0,
+    "mode": "shot",
+    "pure": false,
+    "speed": 70,
+    "sync": true,
+    "wiggle": false,
+    "wiggle_traces": 60
+  }
+}

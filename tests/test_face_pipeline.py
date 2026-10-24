@@ -43,7 +43,7 @@ class FacePipelineTest(unittest.TestCase):
         vol = _volume()
         for mode, index in (("shot", 1), ("recv", 2), ("time", 3)):
             img = display_face(vol, mode, index, max_side=8, agc_window=5)
-            clim = compute_clim(img, "robust")
+            clim = compute_clim(img, "p98")
             rgba = render.to_rgba(img, "seismic", clim)
             tex = render.face_texture(render.face_orientation(img, mode),
                                       "seismic", clim)
@@ -64,6 +64,41 @@ class FacePipelineTest(unittest.TestCase):
         self.assertGreater(hi, float(np.percentile(np.abs(ib), 50)))
         np.testing.assert_allclose(shared_clim([ia, ib], "auto"),
                                    shared_clim([ib, ia], "auto"))
+
+
+class ClimModeTest(unittest.TestCase):
+    """色标口径：自动 = max(8×MAD, P99)，分位 = Pq(|x|)，手动 = 0 中心 ± 半宽。"""
+
+    def test_auto_is_eight_sigma_for_gaussian(self):
+        rng = np.random.default_rng(0)
+        arr = rng.standard_normal(200_000).astype(np.float32)
+        med = float(np.median(arr))
+        mad = float(np.median(np.abs(arr - med)))
+        lo, hi = compute_clim(arr, "auto")
+        self.assertAlmostEqual(0.5 * (hi - lo), 1.4826 * mad * 8.0, places=4)
+        self.assertAlmostEqual(0.5 * (hi + lo), med, places=5)
+
+    def test_auto_falls_back_to_p99_on_heavy_tail(self):
+        arr = np.zeros(10_000, np.float32)
+        arr[::50] = 1000.0                 # 2% 强振幅，MAD 为零
+        lo, hi = compute_clim(arr, "auto")
+        self.assertAlmostEqual(0.5 * (hi - lo), 1000.0)
+        self.assertAlmostEqual(0.5 * (hi + lo), 0.0)
+
+    def test_percentile_modes_use_absolute_quantile(self):
+        rng = np.random.default_rng(1)
+        arr = rng.standard_normal(20_000).astype(np.float32)
+        med = float(np.median(arr))
+        for mode, q in (("p95", 95.0), ("p98", 98.0), ("p99", 99.0)):
+            want = float(np.percentile(np.abs(arr), q))
+            lo, hi = compute_clim(arr, mode)
+            self.assertAlmostEqual(hi - med, want, places=4, msg=mode)
+            self.assertAlmostEqual(lo, med - want, places=4, msg=mode)
+
+    def test_manual_is_zero_centered_half_width(self):
+        # 数据最大幅值是 100，手动值 2.5 只表示窗口 [-2.5, +2.5]
+        arr = np.full(100, 100.0, np.float32)
+        self.assertEqual(compute_clim(arr, "manual", 2.5), (-2.5, 2.5))
 
 
 if __name__ == "__main__":

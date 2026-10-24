@@ -1,0 +1,82 @@
+{
+  "three_d": {
+    "active": 0,
+    "base_clims": 1,
+    "clims": [
+      [
+        -9.306354914832115,
+        8.961227838921547
+      ]
+    ],
+    "content_shown": {
+      "right": true,
+      "slice": true,
+      "trace": true
+    },
+    "datasets": [
+      {
+        "key": "three_d",
+        "mode": "shot",
+        "name": "three_d",
+        "path": "",
+        "pos": {
+          "recv": 4,
+          "shot": 3,
+          "time": 8
+        },
+        "shape": [
+          6,
+          8,
+          32
+        ]
+      }
+    ],
+    "layout_preset": "B",
+    "pair_order": [
+      "slice",
+      "right"
+    ],
+    "panels": 1,
+    "user_size": null
+  },
+  "two_d": {
+    "active": 0,
+    "base_clims": 1,
+    "clims": [
+      [
+        -9.306779403805733,
+        9.082405914187431
+      ]
+    ],
+    "content_shown": {
+      "right": false,
+      "slice": true,
+      "trace": true
+    },
+    "datasets": [
+      {
+        "key": "two_d",
+        "mode": "shot",
+        "name": "two_d",
+        "path": "",
+        "pos": {
+          "recv": 4,
+          "shot": 0,
+          "time": 8
+        },
+        "shape": [
+          1,
+          8,
+          32
+        ]
+      }
+    ],
+    "layout_preset": "B",
+    "pair_order": [
+      "slice",
+      "trace"
+    ],
+    "panels": 1,
+    "user_size": null
+  }
+}

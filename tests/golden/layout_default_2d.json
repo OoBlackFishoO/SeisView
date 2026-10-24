@@ -1,0 +1,39 @@
+{
+  "content_shown": {
+    "right": false,
+    "slice": true,
+    "trace": true
+  },
+  "effective_shown": {
+    "right": false,
+    "slice": true,
+    "trace": true
+  },
+  "inner_orientation": null,
+  "layout_key": "ST",
+  "layout_vis": [
+    "slice",
+    "trace"
+  ],
+  "pair_order": [
+    "slice",
+    "trace"
+  ],
+  "preset": "ST",
+  "root_orientation": "Vertical",
+  "slots": [
+    "slice",
+    "trace",
+    "right"
+  ],
+  "splitter_orientations": [
+    "Vertical"
+  ],
+  "splitter_ratios": [
+    [
+      0.6549,
+      0.3451,
+      0.0
+    ]
+  ]
+}
